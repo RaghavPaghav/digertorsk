@@ -32,6 +32,37 @@ def send_discord_alert(title, price, product_url, image_url, alert_type):
     except Exception:
         pass
 
+def process_products_list(products):
+    """Processes product lists and sends alerts instantly if new items appear."""
+    global first_run
+    new_items_found = False
+    
+    for product in products:
+        prod_id = product["id"]
+        title = product["title"]
+        link = product.get("sourceLink", "https://cssdeals.com")
+        
+        if product.get("skus") and len(product["skus"]) > 0:
+            price = product["skus"][0]["price"]
+            image_url = product["skus"][0]["image"]
+            current_stock = int(product["skus"][0]["quantity"])
+        else:
+            continue
+
+        if not first_run:
+            if prod_id not in inventory_state:
+                print(f"🔥 INSTANT NEW DROP: {title}")
+                send_discord_alert(title, price, link, image_url, "NEW DROP")
+                new_items_found = True
+            elif inventory_state[prod_id] == 0 and current_stock > 0:
+                print(f"🔄 RESTOCK/RETURN: {title}")
+                send_discord_alert(title, price, link, image_url, "RESTOCK")
+                new_items_found = True
+
+        inventory_state[prod_id] = current_stock
+
+    return new_items_found
+
 async def fetch_worker_chunk(session, chunk_id):
     try:
         async with session.get(f"{WORKER_URL}?mode=full&chunk={chunk_id}", timeout=15) as resp:
@@ -45,7 +76,6 @@ async def fetch_worker_chunk(session, chunk_id):
 async def run_full_scan(session):
     global first_run, last_full_scan_time
     try:
-        # Now fetches in 3 smaller chunks to completely avoid Cloudflare limits
         chunk1, chunk2, chunk3 = await asyncio.gather(
             fetch_worker_chunk(session, 1),
             fetch_worker_chunk(session, 2),
@@ -57,27 +87,7 @@ async def run_full_scan(session):
             print(f"⚠️ Warning: Network drop detected (only {len(products)} items). Skipping.")
             return
 
-        for product in products:
-            prod_id = product["id"]
-            title = product["title"]
-            link = product.get("sourceLink", "https://cssdeals.com")
-            
-            if product.get("skus") and len(product["skus"]) > 0:
-                price = product["skus"][0]["price"]
-                image_url = product["skus"][0]["image"]
-                current_stock = int(product["skus"][0]["quantity"])
-            else:
-                continue
-
-            if not first_run:
-                if prod_id not in inventory_state:
-                    print(f"🔥 NEW DROP: {title}")
-                    send_discord_alert(title, price, link, image_url, "NEW DROP")
-                elif inventory_state[prod_id] == 0 and current_stock > 0:
-                    print(f"🔄 RESTOCK/RETURN: {title}")
-                    send_discord_alert(title, price, link, image_url, "RESTOCK")
-
-            inventory_state[prod_id] = current_stock
+        process_products_list(products)
 
         last_full_scan_time = time.time()
         if first_run:
@@ -104,7 +114,7 @@ async def start_server():
 # --- BOT LOOP ---
 async def bot_loop():
     global last_total, last_top_ids
-    print("Starting Optimized Sentinel + Heartbeat Bot...")
+    print("Starting Instant Sentinel + Heartbeat Bot...")
     async with aiohttp.ClientSession() as session:
         print("Running initial full catalog sync...")
         await run_full_scan(session)
@@ -115,30 +125,36 @@ async def bot_loop():
                     if resp.status == 200:
                         sentinel_data = await resp.json()
                         
-                        # NEW: If the Worker fails, it prints exactly why it failed to your screen
                         if sentinel_data.get("worker_error"):
                             print(f"⚠️ Worker Error: {sentinel_data.get('message')}")
-                            await asyncio.sleep(5) # Give the server a 5-second break if blocked
+                            await asyncio.sleep(5)
                             continue
 
                         current_total = sentinel_data.get("total")
-                        current_top_ids = sentinel_data.get("top_ids", [])
-                        
+                        page_1_records = sentinel_data.get("records", [])
+                        current_top_ids = [p["id"] for p in page_1_records]
+
+                        # ⚡ INSTANT CHECK: Process Page 1 records RIGHT NOW before doing any full scan
+                        if not first_run:
+                            process_products_list(page_1_records)
+
+                        # Trigger background full scan if total changed or 60s heartbeat due
                         trigger_scan = (last_total is not None) and (current_total != last_total or current_top_ids != last_top_ids)
                         heartbeat_due = (time.time() - last_full_scan_time) > 60
 
                         if trigger_scan or heartbeat_due:
                             reason = "Change Detected!" if trigger_scan else "60s Deep Sweep"
-                            print(f"⚡ Triggering Full Scan ({reason})")
-                            await run_full_scan(session)
+                            print(f"⚡ Running Background Full Scan ({reason})")
+                            # Run full scan asynchronously so it doesn't block the sentinel loop
+                            asyncio.create_task(run_full_scan(session))
 
                         last_total = current_total
                         last_top_ids = current_top_ids
-            except Exception as e:
+            except Exception:
                 pass
 
             elapsed = time.time() - start_time
-            await asyncio.sleep(max(0.05, 0.3 - elapsed))
+            await asyncio.sleep(max(0.1, 1.0 - elapsed))
 
 async def main():
     await asyncio.gather(
