@@ -14,7 +14,7 @@ last_total = None
 last_top_ids = []
 first_run = True
 last_full_scan_time = 0
-last_drop_time = 0  # Tracks when the last drop happened for Adrenaline Mode
+last_drop_time = 0  
 is_scanning = False  
 MIN_EXPECTED_ITEMS = 9000  
 
@@ -43,9 +43,11 @@ def send_discord_alert(title, price, css_link, orig_link, image_url, alert_type)
     except Exception:
         pass
 
-def process_products_list(products):
+def process_products_list(products, source="background"):
     global first_run
     new_items_found = False
+    alerts_sent_this_batch = 0
+    MAX_ALERTS = 5 # SPAM SHIELD: Never send more than 5 alerts at once
     
     for product in products:
         prod_id = str(product["id"])
@@ -62,15 +64,27 @@ def process_products_list(products):
 
         if not first_run:
             if prod_id not in inventory_state:
-                print(f"🔥 INSTANT NEW DROP: {title}")
-                send_discord_alert(title, price, css_link, orig_link, image_url, "NEW DROP")
-                new_items_found = True
+                # ONLY allow 'NEW DROP' alerts if they were found on Page 1 (Sentinel)
+                # If found in background, it just means a previous scan missed it. Add quietly.
+                if source == "sentinel":
+                    if alerts_sent_this_batch < MAX_ALERTS:
+                        print(f"🔥 INSTANT NEW DROP: {title}")
+                        send_discord_alert(title, price, css_link, orig_link, image_url, "NEW DROP")
+                        alerts_sent_this_batch += 1
+                    new_items_found = True
             elif inventory_state.get(prod_id, 0) == 0 and current_stock > 0:
-                print(f"🔄 RESTOCK/RETURN: {title}")
-                send_discord_alert(title, price, css_link, orig_link, image_url, "RESTOCK")
+                # Restocks can happen anywhere, so we allow background to alert this
+                if alerts_sent_this_batch < MAX_ALERTS:
+                    print(f"🔄 RESTOCK/RETURN: {title}")
+                    send_discord_alert(title, price, css_link, orig_link, image_url, "RESTOCK")
+                    alerts_sent_this_batch += 1
                 new_items_found = True
 
+        # Always update the database so we have accurate stock
         inventory_state[prod_id] = current_stock
+
+    if alerts_sent_this_batch >= MAX_ALERTS:
+        print("⚠️ Spam Shield Activated: Suppressed further alerts for this batch.")
 
     return new_items_found
 
@@ -100,9 +114,9 @@ async def run_full_scan(session):
                 print(f"⚠️ Warning: Network drop detected (only {len(products)} items). Skipping update.")
             return
 
-        found_new = process_products_list(products)
+        # source="background" means it is forbidden from triggering "NEW DROP" alerts
+        found_new = process_products_list(products, source="background")
         
-        # If the background scan found a hidden restock, trigger Adrenaline Mode!
         if found_new:
             last_drop_time = time.time()
 
@@ -140,7 +154,7 @@ async def start_server():
 # --- BOT LOOP ---
 async def bot_loop():
     global last_total, last_top_ids, is_scanning, last_full_scan_time, last_drop_time
-    print("Starting Apex Bot with Adrenaline Mode...")
+    print("Starting Apex Bot with Spam Shields & Adrenaline Mode...")
     async with aiohttp.ClientSession() as session:
         print("Running initial full catalog sync...")
         await run_full_scan(session)
@@ -164,16 +178,14 @@ async def bot_loop():
                         page_1_records = sentinel_data.get("records", [])
                         current_top_ids = [p["id"] for p in page_1_records]
 
-                        # Process Page 1 immediately
                         if not first_run:
-                            found_new = process_products_list(page_1_records)
+                            # source="sentinel" means this IS allowed to trigger "NEW DROP" alerts
+                            found_new = process_products_list(page_1_records, source="sentinel")
                             if found_new:
-                                last_drop_time = time.time() # Trigger Adrenaline Mode!
+                                last_drop_time = time.time() 
 
                         trigger_scan = (last_total is not None) and (current_total != last_total or current_top_ids != last_top_ids)
                         
-                        # --- ADRENALINE MODE LOGIC ---
-                        # If a drop happened in the last 5 minutes (300 seconds), we are in Adrenaline Mode
                         is_adrenaline = (time.time() - last_drop_time) < 300 
                         
                         cooldown_limit = 2 if is_adrenaline else 15
