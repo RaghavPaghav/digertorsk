@@ -34,22 +34,24 @@ def send_discord_alert(title, price, product_url, image_url, alert_type):
 
 async def fetch_worker_chunk(session, chunk_id):
     try:
-        async with session.get(f"{WORKER_URL}?mode=full&chunk={chunk_id}", timeout=10) as resp:
+        async with session.get(f"{WORKER_URL}?mode=full&chunk={chunk_id}", timeout=15) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("records", [])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Chunk {chunk_id} request error: {e}")
     return []
 
 async def run_full_scan(session):
     global first_run, last_full_scan_time
     try:
-        chunk1, chunk2 = await asyncio.gather(
+        # Now fetches in 3 smaller chunks to completely avoid Cloudflare limits
+        chunk1, chunk2, chunk3 = await asyncio.gather(
             fetch_worker_chunk(session, 1),
-            fetch_worker_chunk(session, 2)
+            fetch_worker_chunk(session, 2),
+            fetch_worker_chunk(session, 3)
         )
-        products = chunk1 + chunk2
+        products = chunk1 + chunk2 + chunk3
 
         if len(products) < MIN_EXPECTED_ITEMS and not first_run:
             print(f"⚠️ Warning: Network drop detected (only {len(products)} items). Skipping.")
@@ -109,9 +111,16 @@ async def bot_loop():
         while True:
             start_time = time.time()
             try:
-                async with session.get(f"{WORKER_URL}?mode=sentinel", timeout=3) as resp:
+                async with session.get(f"{WORKER_URL}?mode=sentinel", timeout=5) as resp:
                     if resp.status == 200:
                         sentinel_data = await resp.json()
+                        
+                        # NEW: If the Worker fails, it prints exactly why it failed to your screen
+                        if sentinel_data.get("worker_error"):
+                            print(f"⚠️ Worker Error: {sentinel_data.get('message')}")
+                            await asyncio.sleep(5) # Give the server a 5-second break if blocked
+                            continue
+
                         current_total = sentinel_data.get("total")
                         current_top_ids = sentinel_data.get("top_ids", [])
                         
@@ -125,14 +134,13 @@ async def bot_loop():
 
                         last_total = current_total
                         last_top_ids = current_top_ids
-            except Exception:
+            except Exception as e:
                 pass
 
             elapsed = time.time() - start_time
             await asyncio.sleep(max(0.05, 0.3 - elapsed))
 
 async def main():
-    # Runs the web server and the bot loop simultaneously
     await asyncio.gather(
         start_server(),
         bot_loop()
