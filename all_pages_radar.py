@@ -4,6 +4,12 @@ from aiohttp import web
 import time
 import math
 import os
+import sys
+import json
+
+# Force immediate console output on Render
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # CONFIGURATION
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1531974113067929681/0lJqevpqVFh7Y8XZOSM2CVW_f9lnv-kJfcY48FG8BRytfTqm-Ea56IMyy2d2sKs9fk4s"
@@ -16,11 +22,11 @@ HEADERS = {
     "Referer": "https://cssdeals.com/"
 }
 
-TOP_PAGES_FOR_DROPS = 20   # Pages 1-20 checked every 1.0s for new drops
+TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=None, source_link=None, image_url=None):
-    """Sends a non-blocking Discord embed notification."""
+    """Sends a non-blocking Discord embed notification with URL validation."""
     if not DISCORD_WEBHOOK_URL:
         return
 
@@ -28,9 +34,11 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=Non
     color = 3066993 if is_drop else 15158332  # Green for Drop, Orange for Restock
     header_title = "🌟 NEW PRODUCT DROP" if is_drop else "🚨 WAREHOUSE RESTOCK"
 
+    valid_url = source_link if (source_link and source_link.startswith("http")) else "https://cssdeals.com/"
+
     embed = {
         "title": f"{header_title}: {title[:200]}",
-        "url": source_link if source_link else "https://cssdeals.com/",
+        "url": valid_url,
         "color": color,
         "fields": [
             {"name": "Product ID", "value": f"`{item_id}`", "inline": True},
@@ -46,7 +54,10 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=Non
     if image_url:
         if image_url.startswith("//"):
             image_url = "https:" + image_url
-        embed["thumbnail"] = {"url": image_url}
+        elif not image_url.startswith("http"):
+            image_url = None
+        if image_url:
+            embed["thumbnail"] = {"url": image_url}
 
     payload = {
         "username": "CSSDeals Monitor",
@@ -58,10 +69,11 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=Non
         async with session.post(
             DISCORD_WEBHOOK_URL, 
             json=payload, 
-            timeout=aiohttp.ClientTimeout(total=2.0)
+            timeout=aiohttp.ClientTimeout(total=3.0)
         ) as res:
             if res.status not in (200, 204):
-                print(f"[-] Discord Webhook failed with status: {res.status}")
+                err_text = await res.text()
+                print(f"[-] Discord Webhook failed ({res.status}): {err_text}")
     except Exception as e:
         print(f"[-] Failed to send Discord alert: {e}")
 
@@ -72,6 +84,26 @@ class AllPagesRadar:
         self.total_pages = 1
         self.state_lock = asyncio.Lock()
         self.is_sweeping = False
+        
+        # Dashboard & Status Metrics
+        self.start_time = time.time()
+        self.last_scan_time = None
+        self.last_sweep_time = None
+        self.last_tripwire_time = None
+        self.status_message = "Initializing..."
+        self.event_log = []  # Capped at 50 recent events
+
+    def add_event(self, event_type, title, details, item_id=None):
+        """Adds a structured log event for the Web GUI dashboard."""
+        event = {
+            "timestamp": time.strftime("%H:%M:%S", time.localtime()),
+            "type": event_type,
+            "title": title[:80],
+            "details": details,
+            "item_id": item_id
+        }
+        self.event_log.insert(0, event)
+        self.event_log = self.event_log[:50]  # Keep max 50 events in memory
 
     async def fetch_page(self, session, page_num):
         url = BASE_URL.format(page_num)
@@ -83,57 +115,62 @@ class AllPagesRadar:
             pass
         return None
 
-    async def update_inventory_state(self, session, new_items, source_label="FAST-LOOP", is_initialization=False):
+    async def update_inventory_state(self, session, new_items, source_label="FAST-LOOP", is_initialization=False, is_full_sweep=False):
         async with self.state_lock:
             found_changes = False
             for item_id, current_data in new_items.items():
                 old_data = self.known_inventory.get(item_id)
+                new_qty = current_data["qty"]
+                old_qty = old_data["qty"] if old_data else 0
 
-                # SILENT INITIALIZATION: Prevents Discord spam on startup
                 if is_initialization:
                     self.known_inventory[item_id] = current_data
                     continue
 
-                # Case 1: Stock increased -> WAREHOUSE RESTOCK / RETURN
-                if old_data and current_data["qty"] > old_data["qty"]:
-                    print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' (Qty: {old_data['qty']} -> {current_data['qty']})")
-                    
+                # Case 1: Restock / Return
+                if old_data and new_qty > old_qty:
+                    msg = f"Qty: {old_qty} -> {new_qty}"
+                    print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' ({msg})")
+                    self.add_event("RESTOCK", current_data["title"], msg, item_id)
                     asyncio.create_task(
                         send_discord_alert(
                             session,
                             alert_type=f"{source_label} RESTOCK",
                             title=current_data["title"],
                             item_id=item_id,
-                            qty=current_data["qty"],
+                            qty=new_qty,
                             price=current_data.get("price"),
                             source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
                         )
                     )
-                    self.known_inventory[item_id] = current_data
                     found_changes = True
 
-                # Case 2: Brand new ID -> NEW PRODUCT DROP
-                elif not old_data and current_data["qty"] > 0:
-                    print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' (Qty: {current_data['qty']})")
-                    
+                # Case 2: New Product Drop
+                elif not old_data and new_qty > 0:
+                    msg = f"New Drop | Qty: {new_qty}"
+                    print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' ({msg})")
+                    self.add_event("DROP", current_data["title"], msg, item_id)
                     asyncio.create_task(
                         send_discord_alert(
                             session,
                             alert_type=f"{source_label} DROP",
                             title=current_data["title"],
                             item_id=item_id,
-                            qty=current_data["qty"],
+                            qty=new_qty,
                             price=current_data.get("price"),
                             source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
                         )
                     )
-                    self.known_inventory[item_id] = current_data
                     found_changes = True
 
-                elif not old_data:
-                    self.known_inventory[item_id] = current_data
+                self.known_inventory[item_id] = current_data
+
+            if is_full_sweep and not is_initialization:
+                for known_id in list(self.known_inventory.keys()):
+                    if known_id not in new_items:
+                        self.known_inventory[known_id]["qty"] = 0
 
             return found_changes
 
@@ -142,13 +179,14 @@ class AllPagesRadar:
             return
         
         self.is_sweeping = True
+        self.status_message = f"Deep Sweeping all {self.total_pages} pages..."
         start_time = time.time()
-        print(f"\n[ALL-PAGES SWEEP] Scanning Pages {TOP_PAGES_FOR_DROPS + 1} to {self.total_pages}...")
+        print(f"\n[ALL-PAGES SWEEP] Scanning all {self.total_pages} pages to reconcile inventory...")
 
         try:
             tasks = [
                 self.fetch_page(session, page) 
-                for page in range(TOP_PAGES_FOR_DROPS + 1, self.total_pages + 1)
+                for page in range(1, self.total_pages + 1)
             ]
             
             deep_items = {}
@@ -169,9 +207,11 @@ class AllPagesRadar:
                         "sourceLink": item.get("sourceLink")
                     }
 
-            await self.update_inventory_state(session, deep_items, source_label="DEEP-SWEEP")
+            await self.update_inventory_state(session, deep_items, source_label="FULL-SWEEP", is_full_sweep=True)
             elapsed = time.time() - start_time
-            print(f"[ALL-PAGES SWEEP] Finished in {elapsed:.3f}s | Total Tracked: {len(self.known_inventory)}\n")
+            self.last_sweep_time = time.time()
+            self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
+            print(f"[ALL-PAGES SWEEP] Finished in {elapsed:.3f}s | Active items tracked: {len(deep_items)}\n")
         finally:
             self.is_sweeping = False
 
@@ -201,6 +241,7 @@ class AllPagesRadar:
                 }
 
         found_in_top = await self.update_inventory_state(session, top_items, source_label="TOP-10 DROPS")
+        self.last_scan_time = time.time()
         return page_1_data, found_in_top
 
     async def run(self):
@@ -212,16 +253,17 @@ class AllPagesRadar:
         )
 
         async with aiohttp.ClientSession(connector=connector) as session:
+            self.status_message = "Initializing silent baseline across all pages..."
             print("--- [1/2] Initializing Baseline State (Silent Startup) ---")
             page_1 = await self.fetch_page(session, 1)
             if not page_1 or "data" not in page_1:
                 print("[-] Could not connect to API.")
+                self.status_message = "API Connection Failed!"
                 return
 
             self.current_total = int(page_1["data"]["total"])
             self.total_pages = math.ceil(self.current_total / 100)
             
-            # Silent baseline initialization across all pages
             start_tasks = [self.fetch_page(session, p) for p in range(1, self.total_pages + 1)]
             initial_items = {}
             for data in await asyncio.gather(*start_tasks):
@@ -237,7 +279,10 @@ class AllPagesRadar:
                             "sourceLink": item.get("sourceLink")
                         }
 
-            await self.update_inventory_state(session, initial_items, is_initialization=True)
+            await self.update_inventory_state(session, initial_items, is_initialization=True, is_full_sweep=True)
+            self.last_sweep_time = time.time()
+            self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
+            self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(initial_items)} items across {self.total_pages} pages.")
             print(f"[*] Baseline established silently: {self.current_total} items tracked.")
             print(f"--- [2/2] Radar Armed. Monitoring Discord Webhook ---\n")
 
@@ -252,40 +297,204 @@ class AllPagesRadar:
                     new_total = int(page_1_data["data"]["total"])
                     time_since_last_sweep = time.time() - last_safety_sweep
 
-                    if (new_total > self.current_total and not found_in_top) or (time_since_last_sweep > SAFETY_SWEEP_INTERVAL):
-                        
+                    if (new_total != self.current_total) or (time_since_last_sweep > SAFETY_SWEEP_INTERVAL):
                         if time_since_last_sweep > SAFETY_SWEEP_INTERVAL:
                             print("[SAFETY-NET] Running 60s scheduled full sweep...")
                             last_safety_sweep = time.time()
                         else:
-                            print(f"[TRIPWIRE] Total jumped by +{new_total - self.current_total}!")
+                            diff = new_total - self.current_total
+                            msg = f"Count changed by {diff:+d} ({self.current_total} -> {new_total})"
+                            print(f"[TRIPWIRE] {msg}")
+                            self.add_event("TRIPWIRE", "Catalog Size Change Detected", msg)
+                            self.last_tripwire_time = time.time()
 
                         self.current_total = new_total
                         self.total_pages = math.ceil(self.current_total / 100)
-                        
                         asyncio.create_task(self.background_all_pages_sweep(session))
-                    
-                    elif new_total < self.current_total:
-                        self.current_total = new_total
 
                 elapsed = time.time() - time_start
                 await asyncio.sleep(max(0, 1.0 - elapsed))
 
-# --- DUMMY WEB SERVER (KEEPS RENDER ALIVE) ---
-async def health_check(request):
-    """Returns HTTP 200 so UptimeRobot can keep the container awake."""
-    return web.Response(text="CSSDeals Radar is active and monitoring.")
+# --- WEB DASHBOARD & API HANDLERS ---
+
+async def api_status_handler(request):
+    """Returns JSON metrics for the live web dashboard."""
+    radar = request.app["radar"]
+    now = time.time()
+    
+    def format_relative(ts):
+        if not ts: return "Never"
+        diff = int(now - ts)
+        if diff < 60: return f"{diff}s ago"
+        return f"{diff//60}m {diff%60}s ago"
+
+    uptime_secs = int(now - radar.start_time)
+    hours, remainder = divmod(uptime_secs, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
+
+    data = {
+        "status": radar.status_message,
+        "uptime": uptime_str,
+        "api_total": radar.current_total,
+        "tracked_items": len(radar.known_inventory),
+        "total_pages": radar.total_pages,
+        "last_scan": format_relative(radar.last_scan_time),
+        "last_sweep": format_relative(radar.last_sweep_time),
+        "last_tripwire": format_relative(radar.last_tripwire_time),
+        "events": radar.event_log
+    }
+    return web.json_response(data)
+
+async def health_check_handler(request):
+    """Lightweight plain-text response for UptimeRobot monitoring."""
+    return web.Response(text="OK")
+
+async def dashboard_handler(request):
+    """Serves the Dark-Mode GUI Dashboard."""
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSSDeals Sub-Second Radar</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --border: #334155;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --accent: #38bdf8;
+            --green: #4ade80;
+            --orange: #fb923c;
+            --purple: #c084fc;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: var(--bg); color: var(--text); padding: 2rem; min-height: 100vh; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
+        h1 { font-size: 1.5rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 0.5rem; }
+        .badge { background: #064e3b; color: var(--green); padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; border: 1px solid #059669; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; }
+        .card-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+        .card-value { font-size: 1.75rem; font-weight: 700; color: var(--text); }
+        .card-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+        .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; color: var(--text); }
+        .table-container { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; overflow: hidden; }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
+        th { background: #0f172a; padding: 0.75rem 1rem; color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+        td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); }
+        tr:last-child td { border-bottom: none; }
+        .tag { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 0.35rem; font-size: 0.75rem; font-weight: 700; }
+        .tag-DROP { background: rgba(74, 222, 128, 0.15); color: var(--green); border: 1px solid rgba(74, 222, 128, 0.3); }
+        .tag-RESTOCK { background: rgba(251, 146, 60, 0.15); color: var(--orange); border: 1px solid rgba(251, 146, 60, 0.3); }
+        .tag-TRIPWIRE { background: rgba(192, 132, 252, 0.15); color: var(--purple); border: 1px solid rgba(192, 132, 252, 0.3); }
+        .tag-SYSTEM { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3); }
+        .empty-log { padding: 2rem; text-align: center; color: var(--muted); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>⚡ CSSDeals Sub-Second Radar</h1>
+                <div style="font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem;" id="status-text">Connecting to radar engine...</div>
+            </div>
+            <div class="badge" id="online-badge">● ONLINE</div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Catalog Total (API)</div>
+                <div class="card-value" id="val-total">--</div>
+                <div class="card-sub" id="sub-pages">-- pages total</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Tracked In Memory</div>
+                <div class="card-value" id="val-tracked">--</div>
+                <div class="card-sub">Active non-zero items</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Last Top-10 Scan</div>
+                <div class="card-value" id="val-scan" style="font-size: 1.4rem;">--</div>
+                <div class="card-sub">Heartbeat check</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Last Full Reconcile</div>
+                <div class="card-value" id="val-sweep" style="font-size: 1.4rem;">--</div>
+                <div class="card-sub" id="sub-tripwire">Tripwire: Never</div>
+            </div>
+        </div>
+
+        <div class="section-title">Recent Radar Events & Alerts</div>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 100px;">Time</th>
+                        <th style="width: 110px;">Type</th>
+                        <th>Event / Product Title</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody id="event-tbody">
+                    <tr><td colspan="4" class="empty-log">Loading event stream...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                document.getElementById('status-text').textContent = 'Status: ' + data.status + ' • Uptime: ' + data.uptime;
+                document.getElementById('val-total').textContent = data.api_total.toLocaleString();
+                document.getElementById('sub-pages').textContent = data.total_pages + ' pages total';
+                document.getElementById('val-tracked').textContent = data.tracked_items.toLocaleString();
+                document.getElementById('val-scan').textContent = data.last_scan;
+                document.getElementById('val-sweep').textContent = data.last_sweep;
+                document.getElementById('sub-tripwire').textContent = 'Tripwire: ' + data.last_tripwire;
+
+                const tbody = document.getElementById('event-tbody');
+                if (data.events && data.events.length > 0) {
+                    tbody.innerHTML = data.events.map(ev => `
+                        <tr>
+                            <td style="color: var(--muted); font-family: monospace;">${ev.timestamp}</td>
+                            <td><span class="tag tag-${ev.type}">${ev.type}</span></td>
+                            <td style="font-weight: 500;">${ev.title}</td>
+                            <td style="color: var(--muted);">${ev.details}</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="4" class="empty-log">No alerts detected yet since startup.</td></tr>';
+                }
+            } catch (err) {
+                document.getElementById('status-text').textContent = 'Error fetching live radar metrics...';
+            }
+        }
+        setInterval(updateDashboard, 2000);
+        updateDashboard();
+    </script>
+</body>
+</html>
+"""
+    return web.Response(text=html, content_type="text/html")
 
 async def main_with_server():
     radar = AllPagesRadar()
-    
-    # Run the radar loop as an independent background task
     asyncio.create_task(radar.run())
     
-    # Start the dummy HTTP server on the port Render assigns
     app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
+    app["radar"] = radar  # Attach radar state to web app
+    
+    app.router.add_get("/", dashboard_handler)
+    app.router.add_get("/health", health_check_handler)
+    app.router.add_get("/api/status", api_status_handler)
     
     runner = web.AppRunner(app)
     await runner.setup()
@@ -294,10 +503,8 @@ async def main_with_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     
-    print(f"[+] Web server active on port {port}.")
+    print(f"[+] Web UI Dashboard & API active on port {port}.")
     await asyncio.Event().wait()
-
-import sys
 
 if __name__ == "__main__":
     if sys.platform == 'win32':
