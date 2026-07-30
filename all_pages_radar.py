@@ -25,16 +25,16 @@ HEADERS = {
 TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
 NUM_SWEEP_CHUNKS = 10      # Split full catalog sweep into 10 parallel worker chunks
+CHUNK_JITTER_SECS = 0.15   # 0.15s stagger delay between chunks to avoid Cloudflare spike detection
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
-    """Sends a formatted Discord embed with corrected CSSDeals product links and ¥0 highlighting."""
+    """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
     if not DISCORD_WEBHOOK_URL:
         return
 
     is_drop = "DROP" in alert_type
     is_free_special = (float(price or 0.0) == 0.0)
 
-    # Choose Header Title & Color
     if is_free_special:
         color = 16766720  # Bright Gold / Yellow
         header_title = "🔥 SPECIAL / ¥0 FREE DROP" if is_drop else "🔥 SPECIAL / ¥0 RESTOCK"
@@ -45,7 +45,6 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0
         color = 15158332  # Orange
         header_title = "🚨 WAREHOUSE RESTOCK"
 
-    # EXACT URL FORMAT REQUESTED BY USER
     cssdeals_url = f"https://cssdeals.com/product-detail.html?itemid={item_id}"
     price_display = "🔥 **¥0.00 (FREE/NEW)**" if is_free_special else f"**¥{price}**"
 
@@ -133,8 +132,11 @@ class AllPagesRadar:
             pass
         return None
 
-    async def fetch_pages_in_chunk(self, session, page_list):
-        tasks = [self.fetch_page(session, p, timeout_secs=2.5) for p in page_list]
+    async def fetch_pages_in_chunk_with_jitter(self, session, page_list, delay_secs=0.0):
+        """Staggered worker chunk — pauses for delay_secs before firing its page requests."""
+        if delay_secs > 0:
+            await asyncio.sleep(delay_secs)
+        tasks = [self.fetch_page(session, p, timeout_secs=3.0) for p in page_list]
         return await asyncio.gather(*tasks)
 
     def extract_item_data(self, item):
@@ -164,7 +166,7 @@ class AllPagesRadar:
                 new_qty = current_data["qty"]
                 old_qty = old_data["qty"] if old_data else 0
 
-                # Silent background sweeps ONLY update memory; they never ping Discord
+                # Silent sweeps ONLY update memory; they never ping Discord
                 if silent:
                     self.known_inventory[item_id] = current_data
                     continue
@@ -190,8 +192,7 @@ class AllPagesRadar:
                     print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' ({msg})")
                     self.add_event("DROP", current_data["title"], msg, item_id)
                     asyncio.create_task(
-                        send_discord_alert(
-                            session, alert_type=f"{source_label} DROP",
+                        send_discord_alert(session, alert_type=f"{source_label} DROP",
                             title=current_data["title"], item_id=item_id, qty=new_qty,
                             price=current_data["price"], source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
@@ -201,7 +202,7 @@ class AllPagesRadar:
 
                 self.known_inventory[item_id] = current_data
 
-            # ONLY zero out items (so returns trigger alerts) if EVERY page loaded successfully
+            # ONLY zero out items if EVERY single page loaded successfully
             if is_full_sweep and all_pages_successful:
                 for known_id in list(self.known_inventory.keys()):
                     if known_id not in new_items:
@@ -215,16 +216,19 @@ class AllPagesRadar:
         
         self.is_sweeping = True
         
-        # If initialization fails, keep retrying until we get 100% of the pages
         while True:
-            self.status_message = "10-Chunk Parallel Sweep (1.0s Target)..." if not is_initialization else "Initializing Memory Baseline..."
+            self.status_message = "10-Chunk Jitter Sweep..." if not is_initialization else "Initializing Memory Baseline..."
             start_time = time.time()
             
             all_pages = list(range(1, self.total_pages + 1))
             chunk_size = math.ceil(len(all_pages) / NUM_SWEEP_CHUNKS)
             chunks = [all_pages[i:i + chunk_size] for i in range(0, len(all_pages), chunk_size)]
 
-            chunk_tasks = [self.fetch_pages_in_chunk(session, chunk) for chunk in chunks]
+            # Apply 0.15s staggered jitter delay per chunk to prevent Cloudflare rate-spike detection
+            chunk_tasks = [
+                self.fetch_pages_in_chunk_with_jitter(session, chunk, delay_secs=idx * CHUNK_JITTER_SECS)
+                for idx, chunk in enumerate(chunks)
+            ]
             chunk_results = await asyncio.gather(*chunk_tasks)
 
             deep_items = {}
@@ -232,9 +236,9 @@ class AllPagesRadar:
 
             for page_group in chunk_results:
                 for data in page_group:
-                    if data and "data" in data:
+                    if data and "data" in data and data["data"].get("records"):
                         successful_pages += 1
-                        for item in data["data"].get("records", []):
+                        for item in data["data"]["records"]:
                             item_id, cleaned_data = self.extract_item_data(item)
                             deep_items[item_id] = cleaned_data
 
@@ -242,7 +246,7 @@ class AllPagesRadar:
             
             # SPAM FIX: Do not proceed if baseline is incomplete. Wait and retry.
             if is_initialization and not all_ok:
-                print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 3s to prevent false alerts...")
+                print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 3s...")
                 await asyncio.sleep(3.0)
                 continue
 
@@ -256,7 +260,6 @@ class AllPagesRadar:
             self.last_sweep_time = time.time()
             self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
             
-            # Print a clean status line
             status_text = "OK" if all_ok else f"FAILED ({successful_pages}/{self.total_pages})"
             if not is_initialization:
                 print(f"[10-CHUNK SWEEP] Finished in {elapsed:.3f}s | Sync Status: {status_text}")
@@ -292,8 +295,12 @@ class AllPagesRadar:
         return page_1_data, found_in_top
 
     async def run(self):
+        # Reverted to native aiohttp TCPConnector socket pooling
         connector = aiohttp.TCPConnector(
-            limit=200, limit_per_host=200, keepalive_timeout=60, ttl_dns_cache=300
+            limit=200,
+            limit_per_host=200,
+            keepalive_timeout=60,
+            ttl_dns_cache=300
         )
 
         async with aiohttp.ClientSession(connector=connector) as session:
