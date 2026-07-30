@@ -23,7 +23,7 @@ HEADERS = {
 
 TOP_PAGES_FOR_DROPS = 10     # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60   # Force a full catalog sweep every 60s as a fail-safe
-MAX_CONCURRENT_REQUESTS = 25 # Semaphore limit: fast ~1.5s sweeps without socket congestion
+MAX_CONCURRENT_REQUESTS = 20 # Semaphore limit tuned for smooth 20 req/sec throughput
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
     """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
@@ -117,16 +117,24 @@ class AllPagesRadar:
         self.event_log = self.event_log[:50]
 
     async def fetch_page(self, session, page_num, timeout_secs=5.0):
-        """Fetches an API page using a high-speed semaphore slot."""
+        """Fetches an API page using a semaphore slot."""
         url = BASE_URL.format(page_num)
         async with self.semaphore:
-            try:
-                response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
-                if response.status_code == 200:
-                    return response.json()
-            except Exception:
-                pass
+            for attempt in range(2):
+                try:
+                    response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
+                    if response.status_code == 200:
+                        return response.json()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
         return None
+
+    async def fetch_page_staggered(self, session, page_num, delay_secs=0.0):
+        """Staggers request launch by delay_secs to prevent Cloudflare WAF burst alarms."""
+        if delay_secs > 0:
+            await asyncio.sleep(delay_secs)
+        return await self.fetch_page(session, page_num, timeout_secs=6.0)
 
     def extract_item_data(self, item):
         item_id = str(item["id"])
@@ -191,21 +199,24 @@ class AllPagesRadar:
             return
         
         self.is_sweeping = True
-        self.status_message = "Fast Semaphore Sweep..." if not is_initialization else "Initializing Memory Baseline..."
+        self.status_message = "Staggered Catalog Sweep (20 req/s)..." if not is_initialization else "Initializing Memory Baseline..."
         start_time = time.time()
         
         deep_items = {}
         unfetched_pages = list(range(1, self.total_pages + 1))
         round_num = 0
         
-        # --- HIGH-SPEED ACCUMULATIVE ENGINE ---
-        # Concurrently fetches missing pages using Semaphore(25) until 100% complete
+        # --- 20 REQ/SEC STAGGERED PIPELINE ---
+        # Staggers page requests by 0.05s to stay under Cloudflare's 58-page burst threshold
         while unfetched_pages:
             round_num += 1
             if round_num > 1:
-                await asyncio.sleep(0.4) # Short 400ms breather before retry pass
+                await asyncio.sleep(2.0) # 2s breather if any page failed to clear Cloudflare cooldown
                 
-            tasks = [self.fetch_page(session, p, timeout_secs=5.0) for p in unfetched_pages]
+            tasks = [
+                self.fetch_page_staggered(session, p, delay_secs=idx * 0.05)
+                for idx, p in enumerate(unfetched_pages)
+            ]
             results = await asyncio.gather(*tasks)
             
             next_unfetched = []
@@ -219,8 +230,8 @@ class AllPagesRadar:
                     
             unfetched_pages = next_unfetched
             
-            if round_num >= 6 and unfetched_pages:
-                print(f"[-] Catalog sweep incomplete after 6 passes ({len(unfetched_pages)} pages missing).")
+            if round_num >= 4 and unfetched_pages:
+                print(f"[-] Catalog sweep incomplete after 4 passes ({len(unfetched_pages)} pages missing).")
                 break
 
         all_ok = len(unfetched_pages) == 0
@@ -235,7 +246,7 @@ class AllPagesRadar:
         self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
         
         status_text = "OK (100%)" if all_ok else f"PARTIAL ({self.total_pages - len(unfetched_pages)}/{self.total_pages})"
-        print(f"[FULL-SWEEP] Finished in {elapsed:.2f}s ({round_num} rounds) | Status: {status_text}")
+        print(f"[FULL-SWEEP] Finished in {elapsed:.2f}s ({round_num} rounds) | Status: {status_text} | Tracked: {len(deep_items)}")
         self.is_sweeping = False
 
     async def scan_top_pages_for_drops(self, session):
@@ -281,7 +292,7 @@ class AllPagesRadar:
             self.current_total = int(page_1["data"]["total"])
             self.total_pages = max(1, math.ceil(self.current_total / 100))
             
-            print(f"[*] Connection successful! Establishing accumulative memory baseline ({self.total_pages} pages)...")
+            print(f"[*] Connection successful! Establishing staggered memory baseline ({self.total_pages} pages)...")
             await self.background_all_pages_sweep(session, is_initialization=True)
             
             self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items securely.")
