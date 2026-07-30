@@ -103,6 +103,8 @@ class AllPagesRadar:
         # Dashboard & Status Metrics
         self.start_time = time.time()
         self.last_scan_time = None
+        self.last_scan_ms = 0       # Track execution latency in milliseconds
+        self.last_scan_items = 0    # Track how many items were inspected
         self.last_sweep_time = None
         self.last_tripwire_time = None
         self.scan_counter = 0
@@ -208,7 +210,7 @@ class AllPagesRadar:
                     )
                     found_changes = True
 
-                # ALWAYS overwrite known_inventory so purchases (e.g. 1 -> 0) are remembered!
+                # ALWAYS overwrite known_inventory so purchases (e.g. 1 -> 0) are remembered
                 self.known_inventory[item_id] = current_data
 
             # During a full sweep, zero out any item that vanished from the API catalog
@@ -249,6 +251,7 @@ class AllPagesRadar:
             self.is_sweeping = False
 
     async def scan_top_pages_for_drops(self, session):
+        scan_start_ts = time.time()
         tasks = [self.fetch_page(session, page) for page in range(1, TOP_PAGES_FOR_DROPS + 1)]
         results = await asyncio.gather(*tasks)
 
@@ -266,8 +269,13 @@ class AllPagesRadar:
                 top_items[item_id] = cleaned_data
 
         found_in_top = await self.update_inventory_state(session, top_items, source_label="TOP-10 DROPS")
+        
+        # Telemetry updates for GUI
+        self.last_scan_ms = int((time.time() - scan_start_ts) * 1000)
+        self.last_scan_items = len(top_items)
         self.last_scan_time = time.time()
         self.scan_counter += 1
+        
         return page_1_data, found_in_top
 
     async def run(self):
@@ -365,6 +373,8 @@ async def api_status_handler(request):
         "total_pages": radar.total_pages,
         "scan_counter": radar.scan_counter,
         "last_scan": format_relative(radar.last_scan_time),
+        "last_scan_ms": radar.last_scan_ms,
+        "last_scan_items": radar.last_scan_items,
         "last_sweep": format_relative(radar.last_sweep_time),
         "last_tripwire": format_relative(radar.last_tripwire_time),
         "events": radar.event_log
@@ -454,9 +464,10 @@ async def dashboard_handler(request):
                 <div class="card-sub">Active in-stock items</div>
             </div>
             <div class="card">
-                <div class="card-label">Last Top-10 Scan</div>
-                <div class="card-value" id="val-scan" style="font-size: 1.4rem;">--</div>
-                <div class="card-sub" style="color: var(--green);">● 1.0s Active Loop</div>
+                <div class="card-label">Fast-Loop Speed (Top 10 Pages)</div>
+                <div class="card-value" id="val-scan-speed" style="color: var(--green); font-size: 1.6rem;">-- ms</div>
+                <div class="card-sub" id="sub-scan-stats">Checking items...</div>
+                <div class="card-sub" id="sub-scan-ago" style="color: var(--muted); margin-top: 2px;">Last scan: --</div>
             </div>
             <div class="card">
                 <div class="card-label">Last Full Reconcile</div>
@@ -494,7 +505,12 @@ async def dashboard_handler(request):
                 document.getElementById('val-total').textContent = data.api_total.toLocaleString();
                 document.getElementById('sub-pages').textContent = data.total_pages + ' pages total';
                 document.getElementById('val-tracked').textContent = data.tracked_items.toLocaleString();
-                document.getElementById('val-scan').textContent = data.last_scan;
+                
+                // Rich Fast-Loop Telemetry Card updates
+                document.getElementById('val-scan-speed').textContent = data.last_scan_ms ? data.last_scan_ms + ' ms' : '-- ms';
+                document.getElementById('sub-scan-stats').textContent = 'Checked ' + (data.last_scan_items || 0).toLocaleString() + ' items across 10 pages';
+                document.getElementById('sub-scan-ago').textContent = 'Last scan: ' + data.last_scan + ' • 1.0s Loop';
+
                 document.getElementById('val-sweep').textContent = data.last_sweep;
                 document.getElementById('sub-tripwire').textContent = 'Tripwire: ' + data.last_tripwire;
 
