@@ -24,8 +24,8 @@ HEADERS = {
 
 TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
-NUM_SWEEP_CHUNKS = 10      # Split full catalog sweep into 10 parallel worker chunks
-CHUNK_JITTER_SECS = 0.15   # 0.15s stagger delay between chunks to avoid Cloudflare spike detection
+NUM_SWEEP_CHUNKS = 12      # 12 parallel chunks for ~1.0s full catalog sweeps
+CHUNK_JITTER_SECS = 0.02   # 0.02s micro-stagger to avoid Cloudflare packet-burst alarms
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
     """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
@@ -122,7 +122,7 @@ class AllPagesRadar:
         self.event_log.insert(0, event)
         self.event_log = self.event_log[:50]
 
-    async def fetch_page(self, session, page_num, timeout_secs=2.5):
+    async def fetch_page(self, session, page_num, timeout_secs=3.0):
         url = BASE_URL.format(page_num)
         try:
             async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=timeout_secs)) as response:
@@ -140,19 +140,26 @@ class AllPagesRadar:
         return await asyncio.gather(*tasks)
 
     def extract_item_data(self, item):
+        """Extracts item ID, total stock across ALL SKUs, price, image, and link."""
         item_id = str(item["id"])
-        sku_info = item["skus"][0] if item.get("skus") else {}
-        raw_price = item.get("price") or sku_info.get("price") or item.get("originalPrice") or 0.0
+        skus = item.get("skus") or []
+        
+        # Sum quantity across ALL SKUs so variant restocks are never missed
+        sku_qty = sum(int(s.get("quantity", 0)) for s in skus if isinstance(s, dict))
+        item_qty = int(item.get("quantity", 0) or item.get("stock", 0) or 0)
+        total_qty = max(sku_qty, item_qty)
+
+        raw_price = item.get("price") or (skus[0].get("price") if skus else 0.0) or item.get("originalPrice") or 0.0
         try:
             price_val = float(raw_price)
         except (ValueError, TypeError):
             price_val = 0.0
 
-        image_url = item.get("thumbnail") or sku_info.get("image") or item.get("image")
+        image_url = item.get("thumbnail") or (skus[0].get("image") if skus else None) or item.get("image")
 
         return item_id, {
             "title": item.get("title", "Unknown Product"),
-            "qty": int(sku_info.get("quantity", 0)),
+            "qty": total_qty,
             "price": price_val,
             "image": image_url,
             "sourceLink": item.get("sourceLink")
@@ -166,12 +173,12 @@ class AllPagesRadar:
                 new_qty = current_data["qty"]
                 old_qty = old_data["qty"] if old_data else 0
 
-                # Silent sweeps ONLY update memory; they never ping Discord
+                # Silent mode is ONLY used on startup so Discord isn't spammed
                 if silent:
                     self.known_inventory[item_id] = current_data
                     continue
 
-                # Case 1: Restock / Return
+                # Case 1: Restock / Return (Quantity increased)
                 if old_data and new_qty > old_qty:
                     msg = f"Qty: {old_qty} -> {new_qty} | ¥{current_data['price']}"
                     print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' ({msg})")
@@ -192,7 +199,8 @@ class AllPagesRadar:
                     print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' ({msg})")
                     self.add_event("DROP", current_data["title"], msg, item_id)
                     asyncio.create_task(
-                        send_discord_alert(session, alert_type=f"{source_label} DROP",
+                        send_discord_alert(
+                            session, alert_type=f"{source_label} DROP",
                             title=current_data["title"], item_id=item_id, qty=new_qty,
                             price=current_data["price"], source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
@@ -202,7 +210,7 @@ class AllPagesRadar:
 
                 self.known_inventory[item_id] = current_data
 
-            # ONLY zero out items if EVERY single page loaded successfully
+            # Zero out sold-out items only if every page in the sweep succeeded
             if is_full_sweep and all_pages_successful:
                 for known_id in list(self.known_inventory.keys()):
                     if known_id not in new_items:
@@ -224,7 +232,7 @@ class AllPagesRadar:
             chunk_size = math.ceil(len(all_pages) / NUM_SWEEP_CHUNKS)
             chunks = [all_pages[i:i + chunk_size] for i in range(0, len(all_pages), chunk_size)]
 
-            # Apply 0.15s staggered jitter delay per chunk to prevent Cloudflare rate-spike detection
+            # 0.02s micro-jitter across 12 chunks -> ~0.24s total stagger, ~1.0s sweep time
             chunk_tasks = [
                 self.fetch_pages_in_chunk_with_jitter(session, chunk, delay_secs=idx * CHUNK_JITTER_SECS)
                 for idx, chunk in enumerate(chunks)
@@ -236,23 +244,25 @@ class AllPagesRadar:
 
             for page_group in chunk_results:
                 for data in page_group:
-                    if data and "data" in data and data["data"].get("records"):
+                    if data and "data" in data:
                         successful_pages += 1
-                        for item in data["data"]["records"]:
+                        for item in data["data"].get("records", []):
                             item_id, cleaned_data = self.extract_item_data(item)
                             deep_items[item_id] = cleaned_data
 
             all_ok = (successful_pages == self.total_pages)
             
-            # SPAM FIX: Do not proceed if baseline is incomplete. Wait and retry.
+            # SPAM FIX: Do not proceed if baseline is incomplete on startup.
             if is_initialization and not all_ok:
                 print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 3s...")
                 await asyncio.sleep(3.0)
                 continue
 
+            # CRITICAL FIX: silent is ONLY True during initialization!
+            # Tripwire and 60s safety sweeps will now alert Discord on restocks immediately.
             await self.update_inventory_state(
                 session, deep_items, source_label="10-CHUNK SWEEP", 
-                silent=True, is_full_sweep=True, all_pages_successful=all_ok
+                silent=is_initialization, is_full_sweep=True, all_pages_successful=all_ok
             )
             
             elapsed = time.time() - start_time
@@ -295,7 +305,6 @@ class AllPagesRadar:
         return page_1_data, found_in_top
 
     async def run(self):
-        # Reverted to native aiohttp TCPConnector socket pooling
         connector = aiohttp.TCPConnector(
             limit=200,
             limit_per_host=200,
