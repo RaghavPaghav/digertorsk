@@ -17,7 +17,7 @@ BASE_URL = "https://cssdeals.com/api/product?fields=1&page={}&pageSize=100&sortB
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Referer": "https://cssdeals.com/"
 }
