@@ -36,35 +36,33 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0
 
     # Choose Header Title & Color
     if is_free_special:
-        color = 16766720  # Bright Gold / Yellow for ¥0 Special Drops
+        color = 16766720  # Bright Gold / Yellow
         header_title = "🔥 SPECIAL / ¥0 FREE DROP" if is_drop else "🔥 SPECIAL / ¥0 RESTOCK"
     elif is_drop:
-        color = 3066993   # Green for standard drop
+        color = 3066993   # Green
         header_title = "🌟 NEW PRODUCT DROP"
     else:
-        color = 15158332  # Orange for restock
+        color = 15158332  # Orange
         header_title = "🚨 WAREHOUSE RESTOCK"
 
-    # Primary CSSDeals /product/ path + Alt query parameter link to prevent 404s
-    primary_url = f"https://cssdeals.com/product/{item_id}"
-    alt_url = f"https://cssdeals.com/?id={item_id}"
+    # EXACT URL FORMAT REQUESTED BY USER
+    cssdeals_url = f"https://cssdeals.com/product-detail.html?itemid={item_id}"
     price_display = "🔥 **¥0.00 (FREE/NEW)**" if is_free_special else f"**¥{price}**"
 
     embed = {
         "title": f"{header_title}: {title[:180]}",
-        "url": primary_url,
+        "url": cssdeals_url,
         "color": color,
         "fields": [
             {"name": "Product ID", "value": f"`{item_id}`", "inline": True},
             {"name": "Quantity", "value": f"**{qty}**", "inline": True},
             {"name": "Price", "value": price_display, "inline": True},
-            {"name": "CSSDeals Link", "value": f"[Open Product]({primary_url})\n[Alt Link]({alt_url})", "inline": True}
+            {"name": "CSSDeals Link", "value": f"[Open Product Page]({cssdeals_url})", "inline": True}
         ],
         "footer": {"text": f"CSSDeals Radar • {alert_type}"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
 
-    # Add Original Source/Taobao Link if available
     if source_link and source_link.startswith("http"):
         embed["fields"].append({"name": "Original Link", "value": f"[View Source Page]({source_link})", "inline": True})
 
@@ -131,26 +129,17 @@ class AllPagesRadar:
             async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=timeout_secs)) as response:
                 if response.status == 200:
                     return await response.json()
-                elif page_num == 1:
-                    print(f"[-] API Error (Page {page_num}): HTTP {response.status}")
-        except asyncio.TimeoutError:
-            if page_num == 1:
-                print(f"[-] API Timeout (Page {page_num}) after {timeout_secs}s")
-        except Exception as e:
-            if page_num == 1:
-                print(f"[-] API Connection Exception: {e}")
+        except Exception:
+            pass
         return None
 
     async def fetch_pages_in_chunk(self, session, page_list):
-        """Fetches a specific slice of page numbers concurrently within a worker chunk."""
         tasks = [self.fetch_page(session, p, timeout_secs=2.5) for p in page_list]
         return await asyncio.gather(*tasks)
 
     def extract_item_data(self, item):
-        """Extracts cleaned item ID, price, image, and quantity from any item record."""
         item_id = str(item["id"])
         sku_info = item["skus"][0] if item.get("skus") else {}
-
         raw_price = item.get("price") or sku_info.get("price") or item.get("originalPrice") or 0.0
         try:
             price_val = float(raw_price)
@@ -175,7 +164,7 @@ class AllPagesRadar:
                 new_qty = current_data["qty"]
                 old_qty = old_data["qty"] if old_data else 0
 
-                # Silent sweeps ONLY update memory; never ping Discord
+                # Silent background sweeps ONLY update memory; they never ping Discord
                 if silent:
                     self.known_inventory[item_id] = current_data
                     continue
@@ -187,13 +176,9 @@ class AllPagesRadar:
                     self.add_event("RESTOCK", current_data["title"], msg, item_id)
                     asyncio.create_task(
                         send_discord_alert(
-                            session,
-                            alert_type=f"{source_label} RESTOCK",
-                            title=current_data["title"],
-                            item_id=item_id,
-                            qty=new_qty,
-                            price=current_data["price"],
-                            source_link=current_data.get("sourceLink"),
+                            session, alert_type=f"{source_label} RESTOCK",
+                            title=current_data["title"], item_id=item_id, qty=new_qty,
+                            price=current_data["price"], source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
                         )
                     )
@@ -206,13 +191,9 @@ class AllPagesRadar:
                     self.add_event("DROP", current_data["title"], msg, item_id)
                     asyncio.create_task(
                         send_discord_alert(
-                            session,
-                            alert_type=f"{source_label} DROP",
-                            title=current_data["title"],
-                            item_id=item_id,
-                            qty=new_qty,
-                            price=current_data["price"],
-                            source_link=current_data.get("sourceLink"),
+                            session, alert_type=f"{source_label} DROP",
+                            title=current_data["title"], item_id=item_id, qty=new_qty,
+                            price=current_data["price"], source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
                         )
                     )
@@ -220,8 +201,8 @@ class AllPagesRadar:
 
                 self.known_inventory[item_id] = current_data
 
-            # ONLY zero out missing items if EVERY SINGLE PAGE was fetched without error
-            if is_full_sweep and all_pages_successful and not silent:
+            # ONLY zero out items (so returns trigger alerts) if EVERY page loaded successfully
+            if is_full_sweep and all_pages_successful:
                 for known_id in list(self.known_inventory.keys()):
                     if known_id not in new_items:
                         self.known_inventory[known_id]["qty"] = 0
@@ -233,49 +214,55 @@ class AllPagesRadar:
             return
         
         self.is_sweeping = True
-        self.status_message = "10-Chunk Parallel Sweep (1.0s Target)..." if not is_initialization else "Initializing Memory Baseline..."
-        start_time = time.time()
-        print(f"\n[10-CHUNK SWEEP] Splitting {self.total_pages} pages across {NUM_SWEEP_CHUNKS} parallel workers...")
-
-        try:
-            # Slices all pages into 10 balanced chunks
+        
+        # If initialization fails, keep retrying until we get 100% of the pages
+        while True:
+            self.status_message = "10-Chunk Parallel Sweep (1.0s Target)..." if not is_initialization else "Initializing Memory Baseline..."
+            start_time = time.time()
+            
             all_pages = list(range(1, self.total_pages + 1))
             chunk_size = math.ceil(len(all_pages) / NUM_SWEEP_CHUNKS)
             chunks = [all_pages[i:i + chunk_size] for i in range(0, len(all_pages), chunk_size)]
 
-            # Fire all 10 worker chunks concurrently
             chunk_tasks = [self.fetch_pages_in_chunk(session, chunk) for chunk in chunks]
             chunk_results = await asyncio.gather(*chunk_tasks)
 
             deep_items = {}
             successful_pages = 0
 
-            # Flatten chunk results
             for page_group in chunk_results:
                 for data in page_group:
-                    if not data or "data" not in data or not data["data"].get("records"):
-                        continue
-                    successful_pages += 1
-                    for item in data["data"]["records"]:
-                        item_id, cleaned_data = self.extract_item_data(item)
-                        deep_items[item_id] = cleaned_data
+                    if data and "data" in data:
+                        successful_pages += 1
+                        for item in data["data"].get("records", []):
+                            item_id, cleaned_data = self.extract_item_data(item)
+                            deep_items[item_id] = cleaned_data
 
             all_ok = (successful_pages == self.total_pages)
+            
+            # SPAM FIX: Do not proceed if baseline is incomplete. Wait and retry.
+            if is_initialization and not all_ok:
+                print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 3s to prevent false alerts...")
+                await asyncio.sleep(3.0)
+                continue
+
             await self.update_inventory_state(
-                session, 
-                deep_items, 
-                source_label="10-CHUNK SWEEP", 
-                silent=True, 
-                is_full_sweep=True, 
-                all_pages_successful=all_ok
+                session, deep_items, source_label="10-CHUNK SWEEP", 
+                silent=True, is_full_sweep=True, all_pages_successful=all_ok
             )
+            
             elapsed = time.time() - start_time
             self.last_sweep_ms = int(elapsed * 1000)
             self.last_sweep_time = time.time()
             self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
-            print(f"[10-CHUNK SWEEP] Finished in {elapsed:.3f}s | Tracked: {len(deep_items)} items | All Pages OK: {all_ok}\n")
-        finally:
-            self.is_sweeping = False
+            
+            # Print a clean status line
+            status_text = "OK" if all_ok else f"FAILED ({successful_pages}/{self.total_pages})"
+            if not is_initialization:
+                print(f"[10-CHUNK SWEEP] Finished in {elapsed:.3f}s | Sync Status: {status_text}")
+            break
+            
+        self.is_sweeping = False
 
     async def scan_top_pages_for_drops(self, session):
         scan_start_ts = time.time()
@@ -306,10 +293,7 @@ class AllPagesRadar:
 
     async def run(self):
         connector = aiohttp.TCPConnector(
-            limit=200,
-            limit_per_host=200,
-            keepalive_timeout=60,
-            ttl_dns_cache=300
+            limit=200, limit_per_host=200, keepalive_timeout=60, ttl_dns_cache=300
         )
 
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -318,7 +302,6 @@ class AllPagesRadar:
             while not page_1 or "data" not in page_1:
                 retry_count += 1
                 self.status_message = f"Connecting to API (Attempt {retry_count})..."
-                print(f"[*] Attempting API connection (Attempt {retry_count})...")
                 
                 page_1 = await self.fetch_page(session, 1, timeout_secs=4.0)
                 if not page_1 or "data" not in page_1:
@@ -326,12 +309,12 @@ class AllPagesRadar:
                     await asyncio.sleep(3.0)
 
             self.current_total = int(page_1["data"]["total"])
-            self.total_pages = math.ceil(self.current_total / 100)
+            self.total_pages = max(1, math.ceil(self.current_total / 100))
             
-            print(f"[*] Connection successful! Running 10-chunk initial baseline scan...")
+            print(f"[*] Connection successful! Running 10-chunk strict baseline scan...")
             await self.background_all_pages_sweep(session, is_initialization=True)
             
-            self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items across {self.total_pages} pages.")
+            self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items securely.")
             print(f"[*] Baseline established silently: {self.current_total} items tracked.")
             print(f"--- [2/2] Radar Armed. Monitoring Discord Webhook ---\n")
 
@@ -347,7 +330,6 @@ class AllPagesRadar:
 
                     if (new_total != self.current_total) or (time_since_last_sweep > SAFETY_SWEEP_INTERVAL):
                         if time_since_last_sweep > SAFETY_SWEEP_INTERVAL:
-                            print("[SAFETY-NET] Running 60s scheduled 10-chunk silent sweep...")
                             last_safety_sweep = time.time()
                         else:
                             diff = new_total - self.current_total
@@ -357,7 +339,7 @@ class AllPagesRadar:
                             self.last_tripwire_time = time.time()
 
                         self.current_total = new_total
-                        self.total_pages = math.ceil(self.current_total / 100)
+                        self.total_pages = max(1, math.ceil(self.current_total / 100))
                         asyncio.create_task(self.background_all_pages_sweep(session))
 
                 elapsed = time.time() - time_start
