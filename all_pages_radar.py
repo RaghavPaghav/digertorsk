@@ -24,9 +24,10 @@ HEADERS = {
 
 TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
+NUM_SWEEP_CHUNKS = 10      # Split full catalog sweep into 10 parallel worker chunks
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
-    """Sends a formatted Discord embed with CSSDeals product link and special ¥0 highlighting."""
+    """Sends a formatted Discord embed with corrected CSSDeals product links and ¥0 highlighting."""
     if not DISCORD_WEBHOOK_URL:
         return
 
@@ -44,19 +45,20 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0
         color = 15158332  # Orange for restock
         header_title = "🚨 WAREHOUSE RESTOCK"
 
-    # Always link main header to CSSDeals item page
-    cssdeals_url = f"https://cssdeals.com/item/{item_id}"
+    # Primary CSSDeals /product/ path + Alt query parameter link to prevent 404s
+    primary_url = f"https://cssdeals.com/product/{item_id}"
+    alt_url = f"https://cssdeals.com/?id={item_id}"
     price_display = "🔥 **¥0.00 (FREE/NEW)**" if is_free_special else f"**¥{price}**"
 
     embed = {
         "title": f"{header_title}: {title[:180]}",
-        "url": cssdeals_url,
+        "url": primary_url,
         "color": color,
         "fields": [
             {"name": "Product ID", "value": f"`{item_id}`", "inline": True},
             {"name": "Quantity", "value": f"**{qty}**", "inline": True},
             {"name": "Price", "value": price_display, "inline": True},
-            {"name": "CSSDeals Link", "value": f"[Open in CSSDeals]({cssdeals_url})", "inline": True}
+            {"name": "CSSDeals Link", "value": f"[Open Product]({primary_url})\n[Alt Link]({alt_url})", "inline": True}
         ],
         "footer": {"text": f"CSSDeals Radar • {alert_type}"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -103,9 +105,10 @@ class AllPagesRadar:
         # Dashboard & Status Metrics
         self.start_time = time.time()
         self.last_scan_time = None
-        self.last_scan_ms = 0       # Track execution latency in milliseconds
-        self.last_scan_items = 0    # Track how many items were inspected
+        self.last_scan_ms = 0
+        self.last_scan_items = 0
         self.last_sweep_time = None
+        self.last_sweep_ms = 0
         self.last_tripwire_time = None
         self.scan_counter = 0
         self.status_message = "Initializing..."
@@ -138,12 +141,16 @@ class AllPagesRadar:
                 print(f"[-] API Connection Exception: {e}")
         return None
 
+    async def fetch_pages_in_chunk(self, session, page_list):
+        """Fetches a specific slice of page numbers concurrently within a worker chunk."""
+        tasks = [self.fetch_page(session, p, timeout_secs=2.5) for p in page_list]
+        return await asyncio.gather(*tasks)
+
     def extract_item_data(self, item):
         """Extracts cleaned item ID, price, image, and quantity from any item record."""
-        item_id = str(item["id"])  # Cast to str to prevent string/int dictionary key mismatch
+        item_id = str(item["id"])
         sku_info = item["skus"][0] if item.get("skus") else {}
 
-        # Multi-field fallback to ensure Price is captured
         raw_price = item.get("price") or sku_info.get("price") or item.get("originalPrice") or 0.0
         try:
             price_val = float(raw_price)
@@ -160,7 +167,7 @@ class AllPagesRadar:
             "sourceLink": item.get("sourceLink")
         }
 
-    async def update_inventory_state(self, session, new_items, source_label="FAST-LOOP", is_initialization=False, is_full_sweep=False):
+    async def update_inventory_state(self, session, new_items, source_label="FAST-LOOP", silent=False, is_full_sweep=False, all_pages_successful=False):
         async with self.state_lock:
             found_changes = False
             for item_id, current_data in new_items.items():
@@ -168,7 +175,8 @@ class AllPagesRadar:
                 new_qty = current_data["qty"]
                 old_qty = old_data["qty"] if old_data else 0
 
-                if is_initialization:
+                # Silent sweeps ONLY update memory; never ping Discord
+                if silent:
                     self.known_inventory[item_id] = current_data
                     continue
 
@@ -210,43 +218,62 @@ class AllPagesRadar:
                     )
                     found_changes = True
 
-                # ALWAYS overwrite known_inventory so purchases (e.g. 1 -> 0) are remembered
                 self.known_inventory[item_id] = current_data
 
-            # During a full sweep, zero out any item that vanished from the API catalog
-            if is_full_sweep and not is_initialization:
+            # ONLY zero out missing items if EVERY SINGLE PAGE was fetched without error
+            if is_full_sweep and all_pages_successful and not silent:
                 for known_id in list(self.known_inventory.keys()):
                     if known_id not in new_items:
                         self.known_inventory[known_id]["qty"] = 0
 
             return found_changes
 
-    async def background_all_pages_sweep(self, session):
+    async def background_all_pages_sweep(self, session, is_initialization=False):
         if self.is_sweeping:
             return
         
         self.is_sweeping = True
-        self.status_message = f"Deep Sweeping all {self.total_pages} pages..."
+        self.status_message = "10-Chunk Parallel Sweep (1.0s Target)..." if not is_initialization else "Initializing Memory Baseline..."
         start_time = time.time()
-        print(f"\n[ALL-PAGES SWEEP] Scanning all {self.total_pages} pages to reconcile inventory...")
+        print(f"\n[10-CHUNK SWEEP] Splitting {self.total_pages} pages across {NUM_SWEEP_CHUNKS} parallel workers...")
 
         try:
-            tasks = [self.fetch_page(session, page) for page in range(1, self.total_pages + 1)]
+            # Slices all pages into 10 balanced chunks
+            all_pages = list(range(1, self.total_pages + 1))
+            chunk_size = math.ceil(len(all_pages) / NUM_SWEEP_CHUNKS)
+            chunks = [all_pages[i:i + chunk_size] for i in range(0, len(all_pages), chunk_size)]
+
+            # Fire all 10 worker chunks concurrently
+            chunk_tasks = [self.fetch_pages_in_chunk(session, chunk) for chunk in chunks]
+            chunk_results = await asyncio.gather(*chunk_tasks)
+
             deep_items = {}
-            results = await asyncio.gather(*tasks)
+            successful_pages = 0
 
-            for data in results:
-                if not data or "data" not in data or not data["data"].get("records"):
-                    continue
-                for item in data["data"]["records"]:
-                    item_id, cleaned_data = self.extract_item_data(item)
-                    deep_items[item_id] = cleaned_data
+            # Flatten chunk results
+            for page_group in chunk_results:
+                for data in page_group:
+                    if not data or "data" not in data or not data["data"].get("records"):
+                        continue
+                    successful_pages += 1
+                    for item in data["data"]["records"]:
+                        item_id, cleaned_data = self.extract_item_data(item)
+                        deep_items[item_id] = cleaned_data
 
-            await self.update_inventory_state(session, deep_items, source_label="FULL-SWEEP", is_full_sweep=True)
+            all_ok = (successful_pages == self.total_pages)
+            await self.update_inventory_state(
+                session, 
+                deep_items, 
+                source_label="10-CHUNK SWEEP", 
+                silent=True, 
+                is_full_sweep=True, 
+                all_pages_successful=all_ok
+            )
             elapsed = time.time() - start_time
+            self.last_sweep_ms = int(elapsed * 1000)
             self.last_sweep_time = time.time()
             self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
-            print(f"[ALL-PAGES SWEEP] Finished in {elapsed:.3f}s | Active items tracked: {len(deep_items)}\n")
+            print(f"[10-CHUNK SWEEP] Finished in {elapsed:.3f}s | Tracked: {len(deep_items)} items | All Pages OK: {all_ok}\n")
         finally:
             self.is_sweeping = False
 
@@ -268,9 +295,8 @@ class AllPagesRadar:
                 item_id, cleaned_data = self.extract_item_data(item)
                 top_items[item_id] = cleaned_data
 
-        found_in_top = await self.update_inventory_state(session, top_items, source_label="TOP-10 DROPS")
+        found_in_top = await self.update_inventory_state(session, top_items, source_label="TOP-10 DROPS", silent=False)
         
-        # Telemetry updates for GUI
         self.last_scan_ms = int((time.time() - scan_start_ts) * 1000)
         self.last_scan_items = len(top_items)
         self.last_scan_time = time.time()
@@ -302,21 +328,10 @@ class AllPagesRadar:
             self.current_total = int(page_1["data"]["total"])
             self.total_pages = math.ceil(self.current_total / 100)
             
-            self.status_message = f"Scanning {self.total_pages} pages for baseline..."
-            print(f"[*] Connection successful! Fetching {self.total_pages} pages for baseline...")
+            print(f"[*] Connection successful! Running 10-chunk initial baseline scan...")
+            await self.background_all_pages_sweep(session, is_initialization=True)
             
-            start_tasks = [self.fetch_page(session, p, timeout_secs=3.5) for p in range(1, self.total_pages + 1)]
-            initial_items = {}
-            for data in await asyncio.gather(*start_tasks):
-                if data and "data" in data:
-                    for item in data.get("data", {}).get("records", []):
-                        item_id, cleaned_data = self.extract_item_data(item)
-                        initial_items[item_id] = cleaned_data
-
-            await self.update_inventory_state(session, initial_items, is_initialization=True, is_full_sweep=True)
-            self.last_sweep_time = time.time()
-            self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
-            self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(initial_items)} items across {self.total_pages} pages.")
+            self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items across {self.total_pages} pages.")
             print(f"[*] Baseline established silently: {self.current_total} items tracked.")
             print(f"--- [2/2] Radar Armed. Monitoring Discord Webhook ---\n")
 
@@ -332,7 +347,7 @@ class AllPagesRadar:
 
                     if (new_total != self.current_total) or (time_since_last_sweep > SAFETY_SWEEP_INTERVAL):
                         if time_since_last_sweep > SAFETY_SWEEP_INTERVAL:
-                            print("[SAFETY-NET] Running 60s scheduled full sweep...")
+                            print("[SAFETY-NET] Running 60s scheduled 10-chunk silent sweep...")
                             last_safety_sweep = time.time()
                         else:
                             diff = new_total - self.current_total
@@ -376,6 +391,7 @@ async def api_status_handler(request):
         "last_scan_ms": radar.last_scan_ms,
         "last_scan_items": radar.last_scan_items,
         "last_sweep": format_relative(radar.last_sweep_time),
+        "last_sweep_ms": radar.last_sweep_ms,
         "last_tripwire": format_relative(radar.last_tripwire_time),
         "events": radar.event_log
     }
@@ -410,7 +426,6 @@ async def dashboard_handler(request):
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
         h1 { font-size: 1.5rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 0.5rem; }
         
-        /* 1-Second Animated Heartbeat Beacon */
         .heartbeat-box { display: flex; align-items: center; gap: 0.75rem; background: #064e3b; border: 1px solid #059669; padding: 0.5rem 1rem; border-radius: 9999px; }
         .beacon { width: 12px; height: 12px; background-color: var(--green); border-radius: 50%; box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.7); animation: pulse-animation 1s infinite; }
         @keyframes pulse-animation {
@@ -470,9 +485,10 @@ async def dashboard_handler(request):
                 <div class="card-sub" id="sub-scan-ago" style="color: var(--muted); margin-top: 2px;">Last scan: --</div>
             </div>
             <div class="card">
-                <div class="card-label">Last Full Reconcile</div>
-                <div class="card-value" id="val-sweep" style="font-size: 1.4rem;">--</div>
-                <div class="card-sub" id="sub-tripwire">Tripwire: Never</div>
+                <div class="card-label">10-Chunk Sweep Speed</div>
+                <div class="card-value" id="val-sweep-speed" style="color: var(--accent); font-size: 1.6rem;">-- ms</div>
+                <div class="card-sub" id="sub-sweep-stats">Last sweep: --</div>
+                <div class="card-sub" id="sub-tripwire" style="color: var(--muted); margin-top: 2px;">Tripwire: Never</div>
             </div>
         </div>
 
@@ -506,12 +522,12 @@ async def dashboard_handler(request):
                 document.getElementById('sub-pages').textContent = data.total_pages + ' pages total';
                 document.getElementById('val-tracked').textContent = data.tracked_items.toLocaleString();
                 
-                // Rich Fast-Loop Telemetry Card updates
                 document.getElementById('val-scan-speed').textContent = data.last_scan_ms ? data.last_scan_ms + ' ms' : '-- ms';
                 document.getElementById('sub-scan-stats').textContent = 'Checked ' + (data.last_scan_items || 0).toLocaleString() + ' items across 10 pages';
                 document.getElementById('sub-scan-ago').textContent = 'Last scan: ' + data.last_scan + ' • 1.0s Loop';
 
-                document.getElementById('val-sweep').textContent = data.last_sweep;
+                document.getElementById('val-sweep-speed').textContent = data.last_sweep_ms ? data.last_sweep_ms + ' ms' : '-- ms';
+                document.getElementById('sub-sweep-stats').textContent = 'Last 10-chunk sweep: ' + data.last_sweep;
                 document.getElementById('sub-tripwire').textContent = 'Tripwire: ' + data.last_tripwire;
 
                 const tbody = document.getElementById('event-tbody');
