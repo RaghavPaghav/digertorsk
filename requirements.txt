@@ -1,2 +1,2 @@
 aiohttp==3.11.11
-curl-cffi==0.7.4
+brotli==1.1.0
