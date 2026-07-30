@@ -21,8 +21,9 @@ HEADERS = {
     "Referer": "https://cssdeals.com/"
 }
 
-TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
-SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
+TOP_PAGES_FOR_DROPS = 10     # Pages 1-10 checked every 1.0s for new drops
+SAFETY_SWEEP_INTERVAL = 60   # Force a full catalog sweep every 60s as a fail-safe
+MAX_CONCURRENT_REQUESTS = 25 # Semaphore limit: fast ~1.5s sweeps without socket congestion
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
     """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
@@ -90,6 +91,7 @@ class AllPagesRadar:
         self.total_pages = 1
         self.state_lock = asyncio.Lock()
         self.is_sweeping = False
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         
         # Dashboard & Status Metrics
         self.start_time = time.time()
@@ -114,17 +116,16 @@ class AllPagesRadar:
         self.event_log.insert(0, event)
         self.event_log = self.event_log[:50]
 
-    async def fetch_page(self, session, page_num, timeout_secs=8.0):
-        """Fetches an API page with 2 quick attempts and silent recovery."""
+    async def fetch_page(self, session, page_num, timeout_secs=5.0):
+        """Fetches an API page using a high-speed semaphore slot."""
         url = BASE_URL.format(page_num)
-        for attempt in range(2):
+        async with self.semaphore:
             try:
                 response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
                 if response.status_code == 200:
                     return response.json()
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
         return None
 
     def extract_item_data(self, item):
@@ -190,46 +191,36 @@ class AllPagesRadar:
             return
         
         self.is_sweeping = True
-        self.status_message = "Accumulative Catalog Sweep..." if not is_initialization else "Initializing Memory Baseline..."
+        self.status_message = "Fast Semaphore Sweep..." if not is_initialization else "Initializing Memory Baseline..."
         start_time = time.time()
         
         deep_items = {}
         unfetched_pages = list(range(1, self.total_pages + 1))
         round_num = 0
         
-        # --- ACCUMULATIVE CHECKLIST ENGINE ---
-        # Keep fetching ONLY missing pages until 100% of pages are gathered
+        # --- HIGH-SPEED ACCUMULATIVE ENGINE ---
+        # Concurrently fetches missing pages using Semaphore(25) until 100% complete
         while unfetched_pages:
             round_num += 1
             if round_num > 1:
-                print(f"[*] Round {round_num}: Resuming sweep for {len(unfetched_pages)} remaining pages...")
-                await asyncio.sleep(1.5)  # Let Cloudflare cool down before retry pass
+                await asyncio.sleep(0.4) # Short 400ms breather before retry pass
                 
-            batch_size = 8
-            next_unfetched = []
+            tasks = [self.fetch_page(session, p, timeout_secs=5.0) for p in unfetched_pages]
+            results = await asyncio.gather(*tasks)
             
-            for i in range(0, len(unfetched_pages), batch_size):
-                batch = unfetched_pages[i:i + batch_size]
-                tasks = [self.fetch_page(session, p, timeout_secs=8.0) for p in batch]
-                results = await asyncio.gather(*tasks)
-                
-                for page_num, data in zip(batch, results):
-                    if data and "data" in data and "records" in data["data"]:
-                        for item in data["data"].get("records", []):
-                            item_id, cleaned_data = self.extract_item_data(item)
-                            deep_items[item_id] = cleaned_data
-                    else:
-                        next_unfetched.append(page_num)
-                
-                # Gentle pause between batches to prevent Cloudflare traffic spikes
-                if i + batch_size < len(unfetched_pages):
-                    await asyncio.sleep(0.3)
+            next_unfetched = []
+            for page_num, data in zip(unfetched_pages, results):
+                if data and "data" in data and "records" in data["data"]:
+                    for item in data["data"].get("records", []):
+                        item_id, cleaned_data = self.extract_item_data(item)
+                        deep_items[item_id] = cleaned_data
+                else:
+                    next_unfetched.append(page_num)
                     
             unfetched_pages = next_unfetched
             
-            # Safeguard: if server is totally offline after 10 passes, exit cleanly
-            if round_num >= 10 and unfetched_pages:
-                print(f"[-] Catalog sweep incomplete after 10 passes ({len(unfetched_pages)} pages missing).")
+            if round_num >= 6 and unfetched_pages:
+                print(f"[-] Catalog sweep incomplete after 6 passes ({len(unfetched_pages)} pages missing).")
                 break
 
         all_ok = len(unfetched_pages) == 0
@@ -249,7 +240,7 @@ class AllPagesRadar:
 
     async def scan_top_pages_for_drops(self, session):
         scan_start_ts = time.time()
-        tasks = [self.fetch_page(session, page, timeout_secs=5.0) for page in range(1, TOP_PAGES_FOR_DROPS + 1)]
+        tasks = [self.fetch_page(session, page, timeout_secs=4.0) for page in range(1, TOP_PAGES_FOR_DROPS + 1)]
         results = await asyncio.gather(*tasks)
 
         top_items = {}
@@ -282,7 +273,7 @@ class AllPagesRadar:
                 retry_count += 1
                 self.status_message = f"Connecting to API (Attempt {retry_count})..."
                 
-                page_1 = await self.fetch_page(session, 1, timeout_secs=6.0)
+                page_1 = await self.fetch_page(session, 1, timeout_secs=5.0)
                 if not page_1 or "data" not in page_1:
                     print("[-] Failed to reach API. Retrying in 3 seconds...")
                     await asyncio.sleep(3.0)
