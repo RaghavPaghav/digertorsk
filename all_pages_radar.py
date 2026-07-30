@@ -23,7 +23,6 @@ HEADERS = {
 
 TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
-MAX_CONCURRENT_REQUESTS = 15 # Semaphore limit to prevent Render socket congestion
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
     """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
@@ -78,11 +77,7 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0
     }
 
     try:
-        res = await session.post(
-            DISCORD_WEBHOOK_URL, 
-            json=payload, 
-            timeout=3.0
-        )
+        res = await session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5.0)
         if res.status_code not in (200, 204):
             print(f"[-] Discord Webhook failed ({res.status_code}): {res.text}")
     except Exception as e:
@@ -95,7 +90,6 @@ class AllPagesRadar:
         self.total_pages = 1
         self.state_lock = asyncio.Lock()
         self.is_sweeping = False
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         
         # Dashboard & Status Metrics
         self.start_time = time.time()
@@ -106,6 +100,332 @@ class AllPagesRadar:
         self.last_sweep_ms = 0
         self.last_tripwire_time = None
         self.scan_counter = 0
+        self.status_message = "Initializing..."
+        self.event_log = []
+
+    def add_event(self, event_type, title, details, item_id=None):
+        event = {
+            "timestamp": time.strftime("%H:%M:%S", time.localtime()),
+            "type": event_type,
+            "title": title[:80],
+            "details": details,
+            "item_id": item_id
+        }
+        self.event_log.insert(0, event)
+        self.event_log = self.event_log[:50]
+
+    async def fetch_page(self, session, page_num, timeout_secs=8.0):
+        """Fetches an API page with 3 retries, escalating delays, and explicit error logging."""
+        url = BASE_URL.format(page_num)
+        for attempt in range(3):
+            try:
+                response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code in (429, 403, 503):
+                    if attempt == 2:
+                        print(f"[-] Page {page_num} blocked by Cloudflare (HTTP {response.status_code})")
+                else:
+                    if attempt == 2:
+                        print(f"[-] Page {page_num} failed with HTTP {response.status_code}")
+            except Exception as e:
+                if attempt == 2:
+                    print(f"[-] Page {page_num} connection exception: {type(e).__name__}")
+            
+            # Escalate the backoff delay: 1.0s -> 2.0s -> Failure
+            await asyncio.sleep(1.0 + (attempt * 1.0))
+        return None
+
+    def extract_item_data(self, item):
+        item_id = str(item["id"])
+        sku_info = item["skus"][0] if item.get("skus") else {}
+        raw_price = item.get("price") or sku_info.get("price") or item.get("originalPrice") or 0.0
+        try:
+            price_val = float(raw_price)
+        except (ValueError, TypeError):
+            price_val = 0.0
+
+        image_url = item.get("thumbnail") or sku_info.get("image") or item.get("image")
+
+        return item_id, {
+            "title": item.get("title", "Unknown Product"),
+            "qty": int(sku_info.get("quantity", 0)),
+            "price": price_val,
+            "image": image_url,
+            "sourceLink": item.get("sourceLink")
+        }
+
+    async def update_inventory_state(self, session, new_items, source_label="FAST-LOOP", silent=False, is_full_sweep=False, all_pages_successful=False):
+        async with self.state_lock:
+            found_changes = False
+            for item_id, current_data in new_items.items():
+                old_data = self.known_inventory.get(item_id)
+                new_qty = current_data["qty"]
+                old_qty = old_data["qty"] if old_data else 0
+
+                if silent:
+                    self.known_inventory[item_id] = current_data
+                    continue
+
+                if old_data and new_qty > old_qty:
+                    msg = f"Qty: {old_qty} -> {new_qty} | ¥{current_data['price']}"
+                    print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' ({msg})")
+                    self.add_event("RESTOCK", current_data["title"], msg, item_id)
+                    asyncio.create_task(
+                        send_discord_alert(session, alert_type=f"{source_label} RESTOCK", title=current_data["title"], item_id=item_id, qty=new_qty, price=current_data["price"], source_link=current_data.get("sourceLink"), image_url=current_data.get("image"))
+                    )
+                    found_changes = True
+
+                elif not old_data and new_qty > 0:
+                    msg = f"New Drop | Qty: {new_qty} | ¥{current_data['price']}"
+                    print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' ({msg})")
+                    self.add_event("DROP", current_data["title"], msg, item_id)
+                    asyncio.create_task(
+                        send_discord_alert(session, alert_type=f"{source_label} DROP", title=current_data["title"], item_id=item_id, qty=new_qty, price=current_data["price"], source_link=current_data.get("sourceLink"), image_url=current_data.get("image"))
+                    )
+                    found_changes = True
+
+                self.known_inventory[item_id] = current_data
+
+            if is_full_sweep and all_pages_successful:
+                for known_id in list(self.known_inventory.keys()):
+                    if known_id not in new_items:
+                        self.known_inventory[known_id]["qty"] = 0
+
+            return found_changes
+
+    async def background_all_pages_sweep(self, session, is_initialization=False):
+        if self.is_sweeping:
+            return
+        
+        self.is_sweeping = True
+        
+        while True:
+            self.status_message = "Batched Catalog Sweep..." if not is_initialization else "Initializing Memory Baseline..."
+            start_time = time.time()
+            
+            deep_items = {}
+            successful_pages = 0
+            
+            # --- SEQUENTIAL BATCHING ---
+            # Process in safe batches of 10 pages to completely avoid Render socket congestion
+            batch_size = 10
+            all_pages = list(range(1, self.total_pages + 1))
+            
+            for i in range(0, len(all_pages), batch_size):
+                batch = all_pages[i:i + batch_size]
+                tasks = [self.fetch_page(session, p, timeout_secs=8.0) for p in batch]
+                results = await asyncio.gather(*tasks)
+                
+                for data in results:
+                    if data and "data" in data and data["data"].get("records"):
+                        successful_pages += 1
+                        for item in data["data"]["records"]:
+                            item_id, cleaned_data = self.extract_item_data(item)
+                            deep_items[item_id] = cleaned_data
+                
+                # Cooldown pause to prevent Cloudflare from detecting a massive spike
+                if i + batch_size < len(all_pages):
+                    await asyncio.sleep(0.5)
+
+            all_ok = (successful_pages == self.total_pages)
+            
+            if is_initialization and not all_ok:
+                print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 5s...")
+                await asyncio.sleep(5.0)
+                continue
+
+            await self.update_inventory_state(
+                session, deep_items, source_label="FULL-SWEEP", 
+                silent=True, is_full_sweep=True, all_pages_successful=all_ok
+            )
+            
+            elapsed = time.time() - start_time
+            self.last_sweep_ms = int(elapsed * 1000)
+            self.last_sweep_time = time.time()
+            self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
+            
+            status_text = "OK" if all_ok else f"PARTIAL ({successful_pages}/{self.total_pages})"
+            if not is_initialization:
+                print(f"[FULL-SWEEP] Finished in {elapsed:.3f}s | Sync Status: {status_text}")
+            break
+            
+        self.is_sweeping = False
+
+    async def scan_top_pages_for_drops(self, session):
+        scan_start_ts = time.time()
+        tasks = [self.fetch_page(session, page, timeout_secs=5.0) for page in range(1, TOP_PAGES_FOR_DROPS + 1)]
+        results = await asyncio.gather(*tasks)
+
+        top_items = {}
+        page_1_data = None
+
+        for idx, data in enumerate(results):
+            if not data or "data" not in data:
+                continue
+            if idx == 0:
+                page_1_data = data
+            
+            for item in data.get("data", {}).get("records", []):
+                item_id, cleaned_data = self.extract_item_data(item)
+                top_items[item_id] = cleaned_data
+
+        found_in_top = await self.update_inventory_state(session, top_items, source_label="TOP-10 DROPS", silent=False)
+        
+        self.last_scan_ms = int((time.time() - scan_start_ts) * 1000)
+        self.last_scan_items = len(top_items)
+        self.last_scan_time = time.time()
+        self.scan_counter += 1
+        
+        return page_1_data, found_in_top
+
+    async def run(self):
+        async with AsyncSession(impersonate="chrome120") as session:
+            page_1 = None
+            retry_count = 0
+            while not page_1 or "data" not in page_1:
+                retry_count += 1
+                self.status_message = f"Connecting to API (Attempt {retry_count})..."
+                
+                page_1 = await self.fetch_page(session, 1, timeout_secs=6.0)
+                if not page_1 or "data" not in page_1:
+                    print("[-] Failed to reach API. Retrying in 3 seconds...")
+                    await asyncio.sleep(3.0)
+
+            self.current_total = int(page_1["data"]["total"])
+            self.total_pages = max(1, math.ceil(self.current_total / 100))
+            
+            print(f"[*] Connection successful! Establishing managed memory baseline ({self.total_pages} pages)...")
+            await self.background_all_pages_sweep(session, is_initialization=True)
+            
+            self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items securely.")
+            print(f"[*] Baseline established silently: {len(self.known_inventory)} items tracked.")
+            print(f"--- [2/2] Radar Armed. Monitoring Discord Webhook ---\n")
+
+            last_safety_sweep = time.time()
+
+            while True:
+                time_start = time.time()
+                page_1_data, found_in_top = await self.scan_top_pages_for_drops(session)
+
+                if page_1_data and "data" in page_1_data:
+                    new_total = int(page_1_data["data"]["total"])
+                    time_since_last_sweep = time.time() - last_safety_sweep
+
+                    if (new_total != self.current_total) or (time_since_last_sweep > SAFETY_SWEEP_INTERVAL):
+                        if time_since_last_sweep > SAFETY_SWEEP_INTERVAL:
+                            last_safety_sweep = time.time()
+                        else:
+                            diff = new_total - self.current_total
+                            msg = f"Count changed by {diff:+d} ({self.current_total} -> {new_total})"
+                            print(f"[TRIPWIRE] {msg}")
+                            self.add_event("TRIPWIRE", "Catalog Size Change Detected", msg)
+                            self.last_tripwire_time = time.time()
+
+                        self.current_total = new_total
+                        self.total_pages = max(1, math.ceil(self.current_total / 100))
+                        asyncio.create_task(self.background_all_pages_sweep(session))
+
+                elapsed = time.time() - time_start
+                await asyncio.sleep(max(0, 1.0 - elapsed))
+
+# --- WEB DASHBOARD & API HANDLERS ---
+
+async def api_status_handler(request):
+    radar = request.app["radar"]
+    now = time.time()
+    
+    def format_relative(ts):
+        if not ts: return "Never"
+        diff = int(now - ts)
+        if diff < 60: return f"{diff}s ago"
+        return f"{diff//60}m {diff%60}s ago"
+
+    uptime_secs = int(now - radar.start_time)
+    hours, remainder = divmod(uptime_secs, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
+
+    data = {
+        "status": radar.status_message,
+        "uptime": uptime_str,
+        "api_total": radar.current_total,
+        "tracked_items": len(radar.known_inventory),
+        "total_pages": radar.total_pages,
+        "scan_counter": radar.scan_counter,
+        "last_scan": format_relative(radar.last_scan_time),
+        "last_scan_ms": radar.last_scan_ms,
+        "last_scan_items": radar.last_scan_items,
+        "last_sweep": format_relative(radar.last_sweep_time),
+        "last_sweep_ms": radar.last_sweep_ms,
+        "last_tripwire": format_relative(radar.last_tripwire_time),
+        "events": radar.event_log
+    }
+    return web.json_response(data)
+
+async def health_check_handler(request):
+    return web.Response(text="OK")
+
+async def dashboard_handler(request):
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSSDeals Sub-Second Radar</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --border: #334155;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --accent: #38bdf8;
+            --green: #4ade80;
+            --orange: #fb923c;
+            --purple: #c084fc;
+            --gold: #facc15;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: var(--bg); color: var(--text); padding: 2rem; min-height: 100vh; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
+        h1 { font-size: 1.5rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 0.5rem; }
+        
+        .heartbeat-box { display: flex; align-items: center; gap: 0.75rem; background: #064e3b; border: 1px solid #059669; padding: 0.5rem 1rem; border-radius: 9999px; }
+        .beacon { width: 12px; height: 12px; background-color: var(--green); border-radius: 50%; box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.7); animation: pulse-animation 1s infinite; }
+        @keyframes pulse-animation {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.8); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(74, 222, 128, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
+        }
+        .heartbeat-text { font-size: 0.8rem; font-weight: 700; color: var(--green); text-transform: uppercase; letter-spacing: 0.05em; }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; }
+        .card-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+        .card-value { font-size: 1.75rem; font-weight: 700; color: var(--text); }
+        .card-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+        .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; color: var(--text); }
+        .table-container { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; overflow: hidden; }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
+        th { background: #0f172a; padding: 0.75rem 1rem; color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+        td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); }
+        tr:last-child td { border-bottom: none; }
+        .tag { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 0.35rem; font-size: 0.75rem; font-weight: 700; }
+        .tag-DROP { background: rgba(74, 222, 128, 0.15); color: var(--green); border: 1px solid rgba(74, 222, 128, 0.3); }
+        .tag-RESTOCK { background: rgba(251, 146, 60, 0.15); color: var(--orange); border: 1px solid rgba(251, 146, 60, 0.3); }
+        .tag-TRIPWIRE { background: rgba(192, 132, 252, 0.15); color: var(--purple); border: 1px solid rgba(192, 132, 252, 0.3); }
+        .tag-SYSTEM { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3); }
+        .empty-log { padding: 2rem; text-align: center; color: var(--muted); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>⚡ CSSDeals Sub-Second Radar</h1>
+         self.scan_counter = 0
         self.status_message = "Initializing..."
         self.event_log = []
 
