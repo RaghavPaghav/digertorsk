@@ -13,7 +13,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # CONFIGURATION
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1531974113067929681/0lJqevpqVFh7Y8XZOSM2CVW_f9lnv-kJfcY48FG8BRytfTqm-Ea56IMyy2d2sKs9fk4s"
-BASE_URL = "https://cssdeals.com/api/product?fields=1&page={}&pageSize=100&sortBy=stock&order=desc"
+BASE_URL = "https://cssdeals.com/api/product?fields=1&page={}&pageSize=100"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -25,31 +25,46 @@ HEADERS = {
 TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
 
-async def send_discord_alert(session, alert_type, title, item_id, qty, price=None, source_link=None, image_url=None):
-    """Sends a non-blocking Discord embed notification with URL validation."""
+async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
+    """Sends a formatted Discord embed with CSSDeals product link and special ¥0 highlighting."""
     if not DISCORD_WEBHOOK_URL:
         return
 
     is_drop = "DROP" in alert_type
-    color = 3066993 if is_drop else 15158332  # Green for Drop, Orange for Restock
-    header_title = "🌟 NEW PRODUCT DROP" if is_drop else "🚨 WAREHOUSE RESTOCK"
+    is_free_special = (float(price or 0.0) == 0.0)
 
-    valid_url = source_link if (source_link and source_link.startswith("http")) else "https://cssdeals.com/"
+    # Choose Header Title & Color
+    if is_free_special:
+        color = 16766720  # Bright Gold / Yellow for ¥0 Special Drops
+        header_title = "🔥 SPECIAL / ¥0 FREE DROP" if is_drop else "🔥 SPECIAL / ¥0 RESTOCK"
+    elif is_drop:
+        color = 3066993   # Green for standard drop
+        header_title = "🌟 NEW PRODUCT DROP"
+    else:
+        color = 15158332  # Orange for restock
+        header_title = "🚨 WAREHOUSE RESTOCK"
+
+    # Always link main header to CSSDeals item page
+    cssdeals_url = f"https://cssdeals.com/item/{item_id}"
+    price_display = "🔥 **¥0.00 (FREE/NEW)**" if is_free_special else f"**¥{price}**"
 
     embed = {
-        "title": f"{header_title}: {title[:200]}",
-        "url": valid_url,
+        "title": f"{header_title}: {title[:180]}",
+        "url": cssdeals_url,
         "color": color,
         "fields": [
             {"name": "Product ID", "value": f"`{item_id}`", "inline": True},
             {"name": "Quantity", "value": f"**{qty}**", "inline": True},
+            {"name": "Price", "value": price_display, "inline": True},
+            {"name": "CSSDeals Link", "value": f"[Open in CSSDeals]({cssdeals_url})", "inline": True}
         ],
         "footer": {"text": f"CSSDeals Radar • {alert_type}"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
 
-    if price:
-        embed["fields"].append({"name": "Price", "value": f"¥{price}", "inline": True})
+    # Add Original Source/Taobao Link if available
+    if source_link and source_link.startswith("http"):
+        embed["fields"].append({"name": "Original Link", "value": f"[View Source Page]({source_link})", "inline": True})
 
     if image_url:
         if image_url.startswith("//"):
@@ -60,7 +75,7 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=Non
             embed["thumbnail"] = {"url": image_url}
 
     payload = {
-        "username": "CSSDeals Monitor",
+        "username": "CSSDeals Radar Engine",
         "avatar_url": "https://cssdeals.com/favicon.ico",
         "embeds": [embed]
     }
@@ -90,11 +105,11 @@ class AllPagesRadar:
         self.last_scan_time = None
         self.last_sweep_time = None
         self.last_tripwire_time = None
+        self.scan_counter = 0
         self.status_message = "Initializing..."
-        self.event_log = []  # Capped at 50 recent events
+        self.event_log = []
 
     def add_event(self, event_type, title, details, item_id=None):
-        """Adds a structured log event for the Web GUI dashboard."""
         event = {
             "timestamp": time.strftime("%H:%M:%S", time.localtime()),
             "type": event_type,
@@ -121,6 +136,28 @@ class AllPagesRadar:
                 print(f"[-] API Connection Exception: {e}")
         return None
 
+    def extract_item_data(self, item):
+        """Extracts cleaned item ID, price, image, and quantity from any item record."""
+        item_id = str(item["id"])  # Cast to str to prevent string/int dictionary key mismatch
+        sku_info = item["skus"][0] if item.get("skus") else {}
+
+        # Multi-field fallback to ensure Price is captured
+        raw_price = item.get("price") or sku_info.get("price") or item.get("originalPrice") or 0.0
+        try:
+            price_val = float(raw_price)
+        except (ValueError, TypeError):
+            price_val = 0.0
+
+        image_url = item.get("thumbnail") or sku_info.get("image") or item.get("image")
+
+        return item_id, {
+            "title": item.get("title", "Unknown Product"),
+            "qty": int(sku_info.get("quantity", 0)),
+            "price": price_val,
+            "image": image_url,
+            "sourceLink": item.get("sourceLink")
+        }
+
     async def update_inventory_state(self, session, new_items, source_label="FAST-LOOP", is_initialization=False, is_full_sweep=False):
         async with self.state_lock:
             found_changes = False
@@ -135,7 +172,7 @@ class AllPagesRadar:
 
                 # Case 1: Restock / Return
                 if old_data and new_qty > old_qty:
-                    msg = f"Qty: {old_qty} -> {new_qty}"
+                    msg = f"Qty: {old_qty} -> {new_qty} | ¥{current_data['price']}"
                     print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' ({msg})")
                     self.add_event("RESTOCK", current_data["title"], msg, item_id)
                     asyncio.create_task(
@@ -145,7 +182,7 @@ class AllPagesRadar:
                             title=current_data["title"],
                             item_id=item_id,
                             qty=new_qty,
-                            price=current_data.get("price"),
+                            price=current_data["price"],
                             source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
                         )
@@ -154,7 +191,7 @@ class AllPagesRadar:
 
                 # Case 2: New Product Drop
                 elif not old_data and new_qty > 0:
-                    msg = f"New Drop | Qty: {new_qty}"
+                    msg = f"New Drop | Qty: {new_qty} | ¥{current_data['price']}"
                     print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' ({msg})")
                     self.add_event("DROP", current_data["title"], msg, item_id)
                     asyncio.create_task(
@@ -164,7 +201,7 @@ class AllPagesRadar:
                             title=current_data["title"],
                             item_id=item_id,
                             qty=new_qty,
-                            price=current_data.get("price"),
+                            price=current_data["price"],
                             source_link=current_data.get("sourceLink"),
                             image_url=current_data.get("image")
                         )
@@ -192,11 +229,7 @@ class AllPagesRadar:
         print(f"\n[ALL-PAGES SWEEP] Scanning all {self.total_pages} pages to reconcile inventory...")
 
         try:
-            tasks = [
-                self.fetch_page(session, page) 
-                for page in range(1, self.total_pages + 1)
-            ]
-            
+            tasks = [self.fetch_page(session, page) for page in range(1, self.total_pages + 1)]
             deep_items = {}
             results = await asyncio.gather(*tasks)
 
@@ -204,16 +237,8 @@ class AllPagesRadar:
                 if not data or "data" not in data or not data["data"].get("records"):
                     continue
                 for item in data["data"]["records"]:
-                    item_id = item["id"]
-                    sku_info = item["skus"][0] if item.get("skus") else {}
-                    
-                    deep_items[item_id] = {
-                        "title": item.get("title", "Unknown"),
-                        "qty": int(sku_info.get("quantity", 0)),
-                        "price": sku_info.get("price"),
-                        "image": sku_info.get("image") or item.get("thumbnail"),
-                        "sourceLink": item.get("sourceLink")
-                    }
+                    item_id, cleaned_data = self.extract_item_data(item)
+                    deep_items[item_id] = cleaned_data
 
             await self.update_inventory_state(session, deep_items, source_label="FULL-SWEEP", is_full_sweep=True)
             elapsed = time.time() - start_time
@@ -237,31 +262,23 @@ class AllPagesRadar:
                 page_1_data = data
             
             for item in data.get("data", {}).get("records", []):
-                item_id = item["id"]
-                sku_info = item["skus"][0] if item.get("skus") else {}
-                
-                top_items[item_id] = {
-                    "title": item.get("title", "Unknown"),
-                    "qty": int(sku_info.get("quantity", 0)),
-                    "price": sku_info.get("price"),
-                    "image": sku_info.get("image") or item.get("thumbnail"),
-                    "sourceLink": item.get("sourceLink")
-                }
+                item_id, cleaned_data = self.extract_item_data(item)
+                top_items[item_id] = cleaned_data
 
         found_in_top = await self.update_inventory_state(session, top_items, source_label="TOP-10 DROPS")
         self.last_scan_time = time.time()
+        self.scan_counter += 1
         return page_1_data, found_in_top
 
     async def run(self):
         connector = aiohttp.TCPConnector(
-            limit=110,
-            limit_per_host=110,
+            limit=200,
+            limit_per_host=200,
             keepalive_timeout=60,
             ttl_dns_cache=300
         )
 
         async with aiohttp.ClientSession(connector=connector) as session:
-            # --- RESILIENT STARTUP LOOP ---
             page_1 = None
             retry_count = 0
             while not page_1 or "data" not in page_1:
@@ -285,15 +302,8 @@ class AllPagesRadar:
             for data in await asyncio.gather(*start_tasks):
                 if data and "data" in data:
                     for item in data.get("data", {}).get("records", []):
-                        item_id = item["id"]
-                        sku_info = item["skus"][0] if item.get("skus") else {}
-                        initial_items[item_id] = {
-                            "title": item.get("title", "Unknown"),
-                            "qty": int(sku_info.get("quantity", 0)),
-                            "price": sku_info.get("price"),
-                            "image": sku_info.get("image") or item.get("thumbnail"),
-                            "sourceLink": item.get("sourceLink")
-                        }
+                        item_id, cleaned_data = self.extract_item_data(item)
+                        initial_items[item_id] = cleaned_data
 
             await self.update_inventory_state(session, initial_items, is_initialization=True, is_full_sweep=True)
             self.last_sweep_time = time.time()
@@ -306,7 +316,6 @@ class AllPagesRadar:
 
             while True:
                 time_start = time.time()
-
                 page_1_data, found_in_top = await self.scan_top_pages_for_drops(session)
 
                 if page_1_data and "data" in page_1_data:
@@ -334,7 +343,6 @@ class AllPagesRadar:
 # --- WEB DASHBOARD & API HANDLERS ---
 
 async def api_status_handler(request):
-    """Returns JSON metrics for the live web dashboard."""
     radar = request.app["radar"]
     now = time.time()
     
@@ -355,6 +363,7 @@ async def api_status_handler(request):
         "api_total": radar.current_total,
         "tracked_items": len(radar.known_inventory),
         "total_pages": radar.total_pages,
+        "scan_counter": radar.scan_counter,
         "last_scan": format_relative(radar.last_scan_time),
         "last_sweep": format_relative(radar.last_sweep_time),
         "last_tripwire": format_relative(radar.last_tripwire_time),
@@ -363,11 +372,9 @@ async def api_status_handler(request):
     return web.json_response(data)
 
 async def health_check_handler(request):
-    """Lightweight plain-text response for UptimeRobot monitoring."""
     return web.Response(text="OK")
 
 async def dashboard_handler(request):
-    """Serves the Dark-Mode GUI Dashboard."""
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -385,13 +392,24 @@ async def dashboard_handler(request):
             --green: #4ade80;
             --orange: #fb923c;
             --purple: #c084fc;
+            --gold: #facc15;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         body { background-color: var(--bg); color: var(--text); padding: 2rem; min-height: 100vh; }
         .container { max-width: 1100px; margin: 0 auto; }
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
         h1 { font-size: 1.5rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 0.5rem; }
-        .badge { background: #064e3b; color: var(--green); padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; border: 1px solid #059669; }
+        
+        /* 1-Second Animated Heartbeat Beacon */
+        .heartbeat-box { display: flex; align-items: center; gap: 0.75rem; background: #064e3b; border: 1px solid #059669; padding: 0.5rem 1rem; border-radius: 9999px; }
+        .beacon { width: 12px; height: 12px; background-color: var(--green); border-radius: 50%; box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.7); animation: pulse-animation 1s infinite; }
+        @keyframes pulse-animation {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.8); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(74, 222, 128, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
+        }
+        .heartbeat-text { font-size: 0.8rem; font-weight: 700; color: var(--green); text-transform: uppercase; letter-spacing: 0.05em; }
+
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; }
         .card-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
@@ -418,7 +436,10 @@ async def dashboard_handler(request):
                 <h1>⚡ CSSDeals Sub-Second Radar</h1>
                 <div style="font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem;" id="status-text">Connecting to radar engine...</div>
             </div>
-            <div class="badge" id="online-badge">● ONLINE</div>
+            <div class="heartbeat-box">
+                <div class="beacon"></div>
+                <div class="heartbeat-text" id="scan-counter-text">1.0s Heartbeat • Scan #0</div>
+            </div>
         </header>
 
         <div class="grid">
@@ -430,12 +451,12 @@ async def dashboard_handler(request):
             <div class="card">
                 <div class="card-label">Tracked In Memory</div>
                 <div class="card-value" id="val-tracked">--</div>
-                <div class="card-sub">Active non-zero items</div>
+                <div class="card-sub">Active in-stock items</div>
             </div>
             <div class="card">
                 <div class="card-label">Last Top-10 Scan</div>
                 <div class="card-value" id="val-scan" style="font-size: 1.4rem;">--</div>
-                <div class="card-sub">Heartbeat check</div>
+                <div class="card-sub" style="color: var(--green);">● 1.0s Active Loop</div>
             </div>
             <div class="card">
                 <div class="card-label">Last Full Reconcile</div>
@@ -469,6 +490,7 @@ async def dashboard_handler(request):
                 const data = await res.json();
                 
                 document.getElementById('status-text').textContent = 'Status: ' + data.status + ' • Uptime: ' + data.uptime;
+                document.getElementById('scan-counter-text').textContent = '1.0s Heartbeat • Scan #' + data.scan_counter.toLocaleString();
                 document.getElementById('val-total').textContent = data.api_total.toLocaleString();
                 document.getElementById('sub-pages').textContent = data.total_pages + ' pages total';
                 document.getElementById('val-tracked').textContent = data.tracked_items.toLocaleString();
@@ -493,7 +515,7 @@ async def dashboard_handler(request):
                 document.getElementById('status-text').textContent = 'Error fetching live radar metrics...';
             }
         }
-        setInterval(updateDashboard, 2000);
+        setInterval(updateDashboard, 1000);
         updateDashboard();
     </script>
 </body>
