@@ -21,9 +21,10 @@ HEADERS = {
     "Referer": "https://cssdeals.com/"
 }
 
-TOP_PAGES_FOR_DROPS = 10     # Pages 1-10 checked every 1.0s for new drops
-SAFETY_SWEEP_INTERVAL = 60   # Force a full catalog sweep every 60s as a fail-safe
-MAX_CONCURRENT_REQUESTS = 20 # Semaphore limit tuned for smooth 20 req/sec throughput
+TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
+SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
+NUM_SWEEP_CHUNKS = 10      # Split full catalog sweep into 10 parallel worker chunks
+CHUNK_JITTER_SECS = 0.15   # 0.15s stagger delay between chunks to avoid Cloudflare spike detection
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
     """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
@@ -78,7 +79,7 @@ async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0
     }
 
     try:
-        res = await session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5.0)
+        res = await session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=3.0)
         if res.status_code not in (200, 204):
             print(f"[-] Discord Webhook failed ({res.status_code}): {res.text}")
     except Exception as e:
@@ -91,7 +92,6 @@ class AllPagesRadar:
         self.total_pages = 1
         self.state_lock = asyncio.Lock()
         self.is_sweeping = False
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         
         # Dashboard & Status Metrics
         self.start_time = time.time()
@@ -116,25 +116,22 @@ class AllPagesRadar:
         self.event_log.insert(0, event)
         self.event_log = self.event_log[:50]
 
-    async def fetch_page(self, session, page_num, timeout_secs=5.0):
-        """Fetches an API page using a semaphore slot."""
+    async def fetch_page(self, session, page_num, timeout_secs=4.0):
         url = BASE_URL.format(page_num)
-        async with self.semaphore:
-            for attempt in range(2):
-                try:
-                    response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
-                    if response.status_code == 200:
-                        return response.json()
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
+        try:
+            response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
+            if response.status_code == 200:
+                return response.json()
+        except Exception:
+            pass
         return None
 
-    async def fetch_page_staggered(self, session, page_num, delay_secs=0.0):
-        """Staggers request launch by delay_secs to prevent Cloudflare WAF burst alarms."""
+    async def fetch_pages_in_chunk_with_jitter(self, session, page_list, delay_secs=0.0):
+        """Staggered worker chunk — pauses for delay_secs before firing its page requests."""
         if delay_secs > 0:
             await asyncio.sleep(delay_secs)
-        return await self.fetch_page(session, page_num, timeout_secs=6.0)
+        tasks = [self.fetch_page(session, p, timeout_secs=4.0) for p in page_list]
+        return await asyncio.gather(*tasks)
 
     def extract_item_data(self, item):
         item_id = str(item["id"])
@@ -163,30 +160,44 @@ class AllPagesRadar:
                 new_qty = current_data["qty"]
                 old_qty = old_data["qty"] if old_data else 0
 
+                # Silent sweeps ONLY update memory; they never ping Discord
                 if silent:
                     self.known_inventory[item_id] = current_data
                     continue
 
+                # Case 1: Restock / Return
                 if old_data and new_qty > old_qty:
                     msg = f"Qty: {old_qty} -> {new_qty} | ¥{current_data['price']}"
                     print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' ({msg})")
                     self.add_event("RESTOCK", current_data["title"], msg, item_id)
                     asyncio.create_task(
-                        send_discord_alert(session, alert_type=f"{source_label} RESTOCK", title=current_data["title"], item_id=item_id, qty=new_qty, price=current_data["price"], source_link=current_data.get("sourceLink"), image_url=current_data.get("image"))
+                        send_discord_alert(
+                            session, alert_type=f"{source_label} RESTOCK",
+                            title=current_data["title"], item_id=item_id, qty=new_qty,
+                            price=current_data["price"], source_link=current_data.get("sourceLink"),
+                            image_url=current_data.get("image")
+                        )
                     )
                     found_changes = True
 
+                # Case 2: New Product Drop
                 elif not old_data and new_qty > 0:
                     msg = f"New Drop | Qty: {new_qty} | ¥{current_data['price']}"
                     print(f"\n[{source_label}] 🌟 NEW DROP DETECTED: '{current_data['title']}' ({msg})")
                     self.add_event("DROP", current_data["title"], msg, item_id)
                     asyncio.create_task(
-                        send_discord_alert(session, alert_type=f"{source_label} DROP", title=current_data["title"], item_id=item_id, qty=new_qty, price=current_data["price"], source_link=current_data.get("sourceLink"), image_url=current_data.get("image"))
+                        send_discord_alert(
+                            session, alert_type=f"{source_label} DROP",
+                            title=current_data["title"], item_id=item_id, qty=new_qty,
+                            price=current_data["price"], source_link=current_data.get("sourceLink"),
+                            image_url=current_data.get("image")
+                        )
                     )
                     found_changes = True
 
                 self.known_inventory[item_id] = current_data
 
+            # ONLY zero out items if EVERY single page loaded successfully
             if is_full_sweep and all_pages_successful:
                 for known_id in list(self.known_inventory.keys()):
                     if known_id not in new_items:
@@ -199,59 +210,61 @@ class AllPagesRadar:
             return
         
         self.is_sweeping = True
-        self.status_message = "Staggered Catalog Sweep (20 req/s)..." if not is_initialization else "Initializing Memory Baseline..."
-        start_time = time.time()
         
-        deep_items = {}
-        unfetched_pages = list(range(1, self.total_pages + 1))
-        round_num = 0
-        
-        # --- 20 REQ/SEC STAGGERED PIPELINE ---
-        # Staggers page requests by 0.05s to stay under Cloudflare's 58-page burst threshold
-        while unfetched_pages:
-            round_num += 1
-            if round_num > 1:
-                await asyncio.sleep(2.0) # 2s breather if any page failed to clear Cloudflare cooldown
-                
-            tasks = [
-                self.fetch_page_staggered(session, p, delay_secs=idx * 0.05)
-                for idx, p in enumerate(unfetched_pages)
-            ]
-            results = await asyncio.gather(*tasks)
+        while True:
+            self.status_message = "10-Chunk Jitter Sweep..." if not is_initialization else "Initializing Memory Baseline..."
+            start_time = time.time()
             
-            next_unfetched = []
-            for page_num, data in zip(unfetched_pages, results):
-                if data and "data" in data and "records" in data["data"]:
-                    for item in data["data"].get("records", []):
-                        item_id, cleaned_data = self.extract_item_data(item)
-                        deep_items[item_id] = cleaned_data
-                else:
-                    next_unfetched.append(page_num)
-                    
-            unfetched_pages = next_unfetched
-            
-            if round_num >= 4 and unfetched_pages:
-                print(f"[-] Catalog sweep incomplete after 4 passes ({len(unfetched_pages)} pages missing).")
-                break
+            all_pages = list(range(1, self.total_pages + 1))
+            chunk_size = math.ceil(len(all_pages) / NUM_SWEEP_CHUNKS)
+            chunks = [all_pages[i:i + chunk_size] for i in range(0, len(all_pages), chunk_size)]
 
-        all_ok = len(unfetched_pages) == 0
-        await self.update_inventory_state(
-            session, deep_items, source_label="FULL-SWEEP", 
-            silent=True, is_full_sweep=True, all_pages_successful=all_ok
-        )
-        
-        elapsed = time.time() - start_time
-        self.last_sweep_ms = int(elapsed * 1000)
-        self.last_sweep_time = time.time()
-        self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
-        
-        status_text = "OK (100%)" if all_ok else f"PARTIAL ({self.total_pages - len(unfetched_pages)}/{self.total_pages})"
-        print(f"[FULL-SWEEP] Finished in {elapsed:.2f}s ({round_num} rounds) | Status: {status_text} | Tracked: {len(deep_items)}")
+            # Apply 0.15s staggered jitter delay per chunk to prevent Cloudflare rate-spike detection
+            chunk_tasks = [
+                self.fetch_pages_in_chunk_with_jitter(session, chunk, delay_secs=idx * CHUNK_JITTER_SECS)
+                for idx, chunk in enumerate(chunks)
+            ]
+            chunk_results = await asyncio.gather(*chunk_tasks)
+
+            deep_items = {}
+            successful_pages = 0
+
+            for page_group in chunk_results:
+                for data in page_group:
+                    if data and "data" in data:
+                        successful_pages += 1
+                        for item in data["data"].get("records", []):
+                            item_id, cleaned_data = self.extract_item_data(item)
+                            deep_items[item_id] = cleaned_data
+
+            all_ok = (successful_pages == self.total_pages)
+            
+            # SPAM FIX: Do not proceed if baseline is incomplete. Wait and retry.
+            if is_initialization and not all_ok:
+                print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 3s...")
+                await asyncio.sleep(3.0)
+                continue
+
+            await self.update_inventory_state(
+                session, deep_items, source_label="10-CHUNK SWEEP", 
+                silent=True, is_full_sweep=True, all_pages_successful=all_ok
+            )
+            
+            elapsed = time.time() - start_time
+            self.last_sweep_ms = int(elapsed * 1000)
+            self.last_sweep_time = time.time()
+            self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
+            
+            status_text = "OK" if all_ok else f"FAILED ({successful_pages}/{self.total_pages})"
+            if not is_initialization:
+                print(f"[10-CHUNK SWEEP] Finished in {elapsed:.3f}s | Sync Status: {status_text}")
+            break
+            
         self.is_sweeping = False
 
     async def scan_top_pages_for_drops(self, session):
         scan_start_ts = time.time()
-        tasks = [self.fetch_page(session, page, timeout_secs=4.0) for page in range(1, TOP_PAGES_FOR_DROPS + 1)]
+        tasks = [self.fetch_page(session, page) for page in range(1, TOP_PAGES_FOR_DROPS + 1)]
         results = await asyncio.gather(*tasks)
 
         top_items = {}
@@ -284,7 +297,7 @@ class AllPagesRadar:
                 retry_count += 1
                 self.status_message = f"Connecting to API (Attempt {retry_count})..."
                 
-                page_1 = await self.fetch_page(session, 1, timeout_secs=5.0)
+                page_1 = await self.fetch_page(session, 1, timeout_secs=4.0)
                 if not page_1 or "data" not in page_1:
                     print("[-] Failed to reach API. Retrying in 3 seconds...")
                     await asyncio.sleep(3.0)
@@ -292,11 +305,11 @@ class AllPagesRadar:
             self.current_total = int(page_1["data"]["total"])
             self.total_pages = max(1, math.ceil(self.current_total / 100))
             
-            print(f"[*] Connection successful! Establishing staggered memory baseline ({self.total_pages} pages)...")
+            print(f"[*] Connection successful! Running 10-chunk strict baseline scan (Chrome TLS)...")
             await self.background_all_pages_sweep(session, is_initialization=True)
             
             self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items securely.")
-            print(f"[*] Baseline established silently: {len(self.known_inventory)} items tracked.")
+            print(f"[*] Baseline established silently: {self.current_total} items tracked.")
             print(f"--- [2/2] Radar Armed. Monitoring Discord Webhook ---\n")
 
             last_safety_sweep = time.time()
@@ -448,7 +461,7 @@ async def dashboard_handler(request):
                 <div class="card-sub" id="sub-scan-ago" style="color: var(--muted); margin-top: 2px;">Last scan: --</div>
             </div>
             <div class="card">
-                <div class="card-label">Batched Sweep Speed</div>
+                <div class="card-label">10-Chunk Sweep Speed</div>
                 <div class="card-value" id="val-sweep-speed" style="color: var(--accent); font-size: 1.6rem;">-- ms</div>
                 <div class="card-sub" id="sub-sweep-stats">Last sweep: --</div>
                 <div class="card-sub" id="sub-tripwire" style="color: var(--muted); margin-top: 2px;">Tripwire: Never</div>
@@ -490,7 +503,7 @@ async def dashboard_handler(request):
                 document.getElementById('sub-scan-ago').textContent = 'Last scan: ' + data.last_scan + ' • 1.0s Loop';
 
                 document.getElementById('val-sweep-speed').textContent = data.last_sweep_ms ? data.last_sweep_ms + ' ms' : '-- ms';
-                document.getElementById('sub-sweep-stats').textContent = 'Last sweep: ' + data.last_sweep;
+                document.getElementById('sub-sweep-stats').textContent = 'Last 10-chunk sweep: ' + data.last_sweep;
                 document.getElementById('sub-tripwire').textContent = 'Tripwire: ' + data.last_tripwire;
 
                 const tbody = document.getElementById('event-tbody');
