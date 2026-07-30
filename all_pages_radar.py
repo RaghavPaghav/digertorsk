@@ -115,25 +115,16 @@ class AllPagesRadar:
         self.event_log = self.event_log[:50]
 
     async def fetch_page(self, session, page_num, timeout_secs=8.0):
-        """Fetches an API page with 3 retries, escalating delays, and explicit error logging."""
+        """Fetches an API page with 2 quick attempts and silent recovery."""
         url = BASE_URL.format(page_num)
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = await session.get(url, headers=HEADERS, timeout=timeout_secs)
                 if response.status_code == 200:
                     return response.json()
-                elif response.status_code in (429, 403, 503):
-                    if attempt == 2:
-                        print(f"[-] Page {page_num} blocked by Cloudflare (HTTP {response.status_code})")
-                else:
-                    if attempt == 2:
-                        print(f"[-] Page {page_num} failed with HTTP {response.status_code}")
-            except Exception as e:
-                if attempt == 2:
-                    print(f"[-] Page {page_num} connection exception: {type(e).__name__}")
-            
-            # Escalate the backoff delay: 1.0s -> 2.0s -> Failure
-            await asyncio.sleep(1.0 + (attempt * 1.0))
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         return None
 
     def extract_item_data(self, item):
@@ -199,57 +190,61 @@ class AllPagesRadar:
             return
         
         self.is_sweeping = True
+        self.status_message = "Accumulative Catalog Sweep..." if not is_initialization else "Initializing Memory Baseline..."
+        start_time = time.time()
         
-        while True:
-            self.status_message = "Batched Catalog Sweep..." if not is_initialization else "Initializing Memory Baseline..."
-            start_time = time.time()
+        deep_items = {}
+        unfetched_pages = list(range(1, self.total_pages + 1))
+        round_num = 0
+        
+        # --- ACCUMULATIVE CHECKLIST ENGINE ---
+        # Keep fetching ONLY missing pages until 100% of pages are gathered
+        while unfetched_pages:
+            round_num += 1
+            if round_num > 1:
+                print(f"[*] Round {round_num}: Resuming sweep for {len(unfetched_pages)} remaining pages...")
+                await asyncio.sleep(1.5)  # Let Cloudflare cool down before retry pass
+                
+            batch_size = 8
+            next_unfetched = []
             
-            deep_items = {}
-            successful_pages = 0
-            
-            # --- SEQUENTIAL BATCHING ---
-            # Process in safe batches of 10 pages to completely avoid Render socket congestion
-            batch_size = 10
-            all_pages = list(range(1, self.total_pages + 1))
-            
-            for i in range(0, len(all_pages), batch_size):
-                batch = all_pages[i:i + batch_size]
+            for i in range(0, len(unfetched_pages), batch_size):
+                batch = unfetched_pages[i:i + batch_size]
                 tasks = [self.fetch_page(session, p, timeout_secs=8.0) for p in batch]
                 results = await asyncio.gather(*tasks)
                 
-                for data in results:
-                    if data and "data" in data and data["data"].get("records"):
-                        successful_pages += 1
-                        for item in data["data"]["records"]:
+                for page_num, data in zip(batch, results):
+                    if data and "data" in data and "records" in data["data"]:
+                        for item in data["data"].get("records", []):
                             item_id, cleaned_data = self.extract_item_data(item)
                             deep_items[item_id] = cleaned_data
+                    else:
+                        next_unfetched.append(page_num)
                 
-                # Cooldown pause to prevent Cloudflare from detecting a massive spike
-                if i + batch_size < len(all_pages):
-                    await asyncio.sleep(0.5)
+                # Gentle pause between batches to prevent Cloudflare traffic spikes
+                if i + batch_size < len(unfetched_pages):
+                    await asyncio.sleep(0.3)
+                    
+            unfetched_pages = next_unfetched
+            
+            # Safeguard: if server is totally offline after 10 passes, exit cleanly
+            if round_num >= 10 and unfetched_pages:
+                print(f"[-] Catalog sweep incomplete after 10 passes ({len(unfetched_pages)} pages missing).")
+                break
 
-            all_ok = (successful_pages == self.total_pages)
-            
-            if is_initialization and not all_ok:
-                print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 5s...")
-                await asyncio.sleep(5.0)
-                continue
-
-            await self.update_inventory_state(
-                session, deep_items, source_label="FULL-SWEEP", 
-                silent=True, is_full_sweep=True, all_pages_successful=all_ok
-            )
-            
-            elapsed = time.time() - start_time
-            self.last_sweep_ms = int(elapsed * 1000)
-            self.last_sweep_time = time.time()
-            self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
-            
-            status_text = "OK" if all_ok else f"PARTIAL ({successful_pages}/{self.total_pages})"
-            if not is_initialization:
-                print(f"[FULL-SWEEP] Finished in {elapsed:.3f}s | Sync Status: {status_text}")
-            break
-            
+        all_ok = len(unfetched_pages) == 0
+        await self.update_inventory_state(
+            session, deep_items, source_label="FULL-SWEEP", 
+            silent=True, is_full_sweep=True, all_pages_successful=all_ok
+        )
+        
+        elapsed = time.time() - start_time
+        self.last_sweep_ms = int(elapsed * 1000)
+        self.last_sweep_time = time.time()
+        self.status_message = "Monitoring Top 10 Pages (1.0s Heartbeat)"
+        
+        status_text = "OK (100%)" if all_ok else f"PARTIAL ({self.total_pages - len(unfetched_pages)}/{self.total_pages})"
+        print(f"[FULL-SWEEP] Finished in {elapsed:.2f}s ({round_num} rounds) | Status: {status_text}")
         self.is_sweeping = False
 
     async def scan_top_pages_for_drops(self, session):
@@ -295,7 +290,7 @@ class AllPagesRadar:
             self.current_total = int(page_1["data"]["total"])
             self.total_pages = max(1, math.ceil(self.current_total / 100))
             
-            print(f"[*] Connection successful! Establishing managed memory baseline ({self.total_pages} pages)...")
+            print(f"[*] Connection successful! Establishing accumulative memory baseline ({self.total_pages} pages)...")
             await self.background_all_pages_sweep(session, is_initialization=True)
             
             self.add_event("SYSTEM", "Baseline Established", f"Tracked {len(self.known_inventory)} items securely.")
@@ -425,4 +420,124 @@ async def dashboard_handler(request):
         <header>
             <div>
                 <h1>⚡ CSSDeals Sub-Second Radar</h1>
- 
+                <div style="font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem;" id="status-text">Connecting to radar engine...</div>
+            </div>
+            <div class="heartbeat-box">
+                <div class="beacon"></div>
+                <div class="heartbeat-text" id="scan-counter-text">1.0s Heartbeat • Scan #0</div>
+            </div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Catalog Total (API)</div>
+                <div class="card-value" id="val-total">--</div>
+                <div class="card-sub" id="sub-pages">-- pages total</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Tracked In Memory</div>
+                <div class="card-value" id="val-tracked">--</div>
+                <div class="card-sub">Active in-stock items</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Fast-Loop Speed (Top 10 Pages)</div>
+                <div class="card-value" id="val-scan-speed" style="color: var(--green); font-size: 1.6rem;">-- ms</div>
+                <div class="card-sub" id="sub-scan-stats">Checking items...</div>
+                <div class="card-sub" id="sub-scan-ago" style="color: var(--muted); margin-top: 2px;">Last scan: --</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Batched Sweep Speed</div>
+                <div class="card-value" id="val-sweep-speed" style="color: var(--accent); font-size: 1.6rem;">-- ms</div>
+                <div class="card-sub" id="sub-sweep-stats">Last sweep: --</div>
+                <div class="card-sub" id="sub-tripwire" style="color: var(--muted); margin-top: 2px;">Tripwire: Never</div>
+            </div>
+        </div>
+
+        <div class="section-title">Recent Radar Events & Alerts</div>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 100px;">Time</th>
+                        <th style="width: 110px;">Type</th>
+                        <th>Event / Product Title</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody id="event-tbody">
+                    <tr><td colspan="4" class="empty-log">Loading event stream...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                document.getElementById('status-text').textContent = 'Status: ' + data.status + ' • Uptime: ' + data.uptime;
+                document.getElementById('scan-counter-text').textContent = '1.0s Heartbeat • Scan #' + data.scan_counter.toLocaleString();
+                document.getElementById('val-total').textContent = data.api_total.toLocaleString();
+                document.getElementById('sub-pages').textContent = data.total_pages + ' pages total';
+                document.getElementById('val-tracked').textContent = data.tracked_items.toLocaleString();
+                
+                document.getElementById('val-scan-speed').textContent = data.last_scan_ms ? data.last_scan_ms + ' ms' : '-- ms';
+                document.getElementById('sub-scan-stats').textContent = 'Checked ' + (data.last_scan_items || 0).toLocaleString() + ' items across 10 pages';
+                document.getElementById('sub-scan-ago').textContent = 'Last scan: ' + data.last_scan + ' • 1.0s Loop';
+
+                document.getElementById('val-sweep-speed').textContent = data.last_sweep_ms ? data.last_sweep_ms + ' ms' : '-- ms';
+                document.getElementById('sub-sweep-stats').textContent = 'Last sweep: ' + data.last_sweep;
+                document.getElementById('sub-tripwire').textContent = 'Tripwire: ' + data.last_tripwire;
+
+                const tbody = document.getElementById('event-tbody');
+                if (data.events && data.events.length > 0) {
+                    tbody.innerHTML = data.events.map(ev => `
+                        <tr>
+                            <td style="color: var(--muted); font-family: monospace;">${ev.timestamp}</td>
+                            <td><span class="tag tag-${ev.type}">${ev.type}</span></td>
+                            <td style="font-weight: 500;">${ev.title}</td>
+                            <td style="color: var(--muted);">${ev.details}</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="4" class="empty-log">No alerts detected yet since startup.</td></tr>';
+                }
+            } catch (err) {
+                document.getElementById('status-text').textContent = 'Error fetching live radar metrics...';
+            }
+        }
+        setInterval(updateDashboard, 1000);
+        updateDashboard();
+    </script>
+</body>
+</html>
+"""
+    return web.Response(text=html, content_type="text/html")
+
+async def main_with_server():
+    radar = AllPagesRadar()
+    asyncio.create_task(radar.run())
+    
+    app = web.Application()
+    app["radar"] = radar
+    
+    app.router.add_get("/", dashboard_handler)
+    app.router.add_get("/health", health_check_handler)
+    app.router.add_get("/api/status", api_status_handler)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    print(f"[+] Web UI Dashboard & API active on port {port}.")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main_with_server())
