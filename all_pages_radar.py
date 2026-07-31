@@ -24,8 +24,8 @@ HEADERS = {
 
 TOP_PAGES_FOR_DROPS = 10   # Pages 1-10 checked every 1.0s for new drops
 SAFETY_SWEEP_INTERVAL = 60 # Force a full catalog sweep every 60s as a fail-safe
-NUM_SWEEP_CHUNKS = 12      # 12 parallel chunks for ~1.0s full catalog sweeps
-CHUNK_JITTER_SECS = 0.02   # 0.02s micro-stagger to avoid Cloudflare packet-burst alarms
+NUM_SWEEP_CHUNKS = 10      # Split full catalog sweep into 10 parallel worker chunks
+CHUNK_JITTER_SECS = 0.15   # 0.15s stagger delay between chunks to avoid Cloudflare spike detection
 
 async def send_discord_alert(session, alert_type, title, item_id, qty, price=0.0, source_link=None, image_url=None):
     """Sends a formatted Discord embed with CSSDeals product links and ¥0 highlighting."""
@@ -136,15 +136,14 @@ class AllPagesRadar:
         """Staggered worker chunk — pauses for delay_secs before firing its page requests."""
         if delay_secs > 0:
             await asyncio.sleep(delay_secs)
-        tasks = [self.fetch_page(session, p, timeout_secs=3.0) for p in page_list]
+        tasks = [self.fetch_page(session, p, timeout_secs=3.5) for p in page_list]
         return await asyncio.gather(*tasks)
 
     def extract_item_data(self, item):
-        """Extracts item ID, total stock across ALL SKUs, price, image, and link."""
         item_id = str(item["id"])
         skus = item.get("skus") or []
         
-        # Sum quantity across ALL SKUs so variant restocks are never missed
+        # Sum quantity across all SKUs so variant restocks trigger correctly
         sku_qty = sum(int(s.get("quantity", 0)) for s in skus if isinstance(s, dict))
         item_qty = int(item.get("quantity", 0) or item.get("stock", 0) or 0)
         total_qty = max(sku_qty, item_qty)
@@ -173,12 +172,12 @@ class AllPagesRadar:
                 new_qty = current_data["qty"]
                 old_qty = old_data["qty"] if old_data else 0
 
-                # Silent mode is ONLY used on startup so Discord isn't spammed
+                # Silent mode is only used on initial startup
                 if silent:
                     self.known_inventory[item_id] = current_data
                     continue
 
-                # Case 1: Restock / Return (Quantity increased)
+                # Case 1: Restock / Return
                 if old_data and new_qty > old_qty:
                     msg = f"Qty: {old_qty} -> {new_qty} | ¥{current_data['price']}"
                     print(f"\n[{source_label}] 🚨 RESTOCK ALERT: '{current_data['title']}' ({msg})")
@@ -232,7 +231,6 @@ class AllPagesRadar:
             chunk_size = math.ceil(len(all_pages) / NUM_SWEEP_CHUNKS)
             chunks = [all_pages[i:i + chunk_size] for i in range(0, len(all_pages), chunk_size)]
 
-            # 0.02s micro-jitter across 12 chunks -> ~0.24s total stagger, ~1.0s sweep time
             chunk_tasks = [
                 self.fetch_pages_in_chunk_with_jitter(session, chunk, delay_secs=idx * CHUNK_JITTER_SECS)
                 for idx, chunk in enumerate(chunks)
@@ -244,22 +242,20 @@ class AllPagesRadar:
 
             for page_group in chunk_results:
                 for data in page_group:
-                    if data and "data" in data:
+                    if data and "data" in data and data["data"].get("records"):
                         successful_pages += 1
-                        for item in data["data"].get("records", []):
+                        for item in data["data"]["records"]:
                             item_id, cleaned_data = self.extract_item_data(item)
                             deep_items[item_id] = cleaned_data
 
             all_ok = (successful_pages == self.total_pages)
             
-            # SPAM FIX: Do not proceed if baseline is incomplete on startup.
+            # If baseline fails on startup, retry cleanly
             if is_initialization and not all_ok:
                 print(f"[-] Baseline incomplete ({successful_pages}/{self.total_pages} pages). Retrying in 3s...")
                 await asyncio.sleep(3.0)
                 continue
 
-            # CRITICAL FIX: silent is ONLY True during initialization!
-            # Tripwire and 60s safety sweeps will now alert Discord on restocks immediately.
             await self.update_inventory_state(
                 session, deep_items, source_label="10-CHUNK SWEEP", 
                 silent=is_initialization, is_full_sweep=True, all_pages_successful=all_ok
@@ -306,10 +302,7 @@ class AllPagesRadar:
 
     async def run(self):
         connector = aiohttp.TCPConnector(
-            limit=200,
-            limit_per_host=200,
-            keepalive_timeout=60,
-            ttl_dns_cache=300
+            limit=200, limit_per_host=200, keepalive_timeout=60, ttl_dns_cache=300
         )
 
         async with aiohttp.ClientSession(connector=connector) as session:
